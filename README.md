@@ -88,9 +88,12 @@ POST /v1/plan
 ## Grenzen
 
 Siehe [Spec](docs/specs/2026-11-14-rustis.md#open-acceptance-limits-must-stay-visible-until-resolved):
-NeTEx-Datensätze (SNCF, Trenitalia) nicht importiert; GTFS-Flex nicht geroutet; Anschluss-
+NeTEx für SNCF/Trenitalia wird importiert (streamend, Kalender und DST); andere
+NeTEx-Profile, Betreiber-/Zugdarstellung, Reservierungsflags und NeTEx-Interchanges
+sind noch nicht vollständig unterstützt. [Details und Messung](docs/measurements/2026-11-14-rtp78-netex.md).
+GTFS-Flex nicht geroutet; Anschluss-
 Typen 1/4/5 nicht ausgenutzt; keine Duplikat-Zusammenführung über Feeds; MOTIS-Lua-Skripte
-nicht angewandt; Horizont ist eine benannte Importeinstellung (Kürzungen werden gezählt).
+nicht allgemein angewandt (Trenitalia-Typzuordnung umgesetzt); Horizont ist eine benannte Importeinstellung (Kürzungen werden gezählt).
 
 ## Tests
 
