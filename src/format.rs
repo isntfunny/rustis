@@ -162,7 +162,11 @@ pub struct Range {
 
 pub const MAX_SECTION_ID: usize = 32;
 
-pub fn parse_directory(file: &[u8], magic: &[u8; 8], expected: &[Sec]) -> Result<[Range; MAX_SECTION_ID]> {
+pub fn parse_directory(
+    file: &[u8],
+    magic: &[u8; 8],
+    expected: &[Sec],
+) -> Result<[Range; MAX_SECTION_ID]> {
     ensure!(
         file.len() >= 16,
         "timetable file truncated ({} bytes)",

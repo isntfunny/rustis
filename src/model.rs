@@ -1,14 +1,12 @@
 //! Public request/response types and persisted metadata.
 use serde::{Deserialize, Serialize};
 
-/// Hard request bounds. Each query allocates scratch proportional to
-/// `stops × (max_transfers + 1)`, so these bounds are part of the RAM budget.
+/// Hard request bounds (per-query scratch grows with the explored region and
+/// the number of rounds, so these bounds are part of the RAM budget).
 pub const MAX_ENDPOINTS: usize = 64;
 pub const MAX_TRANSFERS: u8 = 8;
 pub const MAX_RESULTS: usize = 10;
 pub const MAX_BBOX_RESULTS: usize = 1000;
-/// Snapshots hold the service date plus the following day (`OvernightDays(1)`).
-pub const SNAPSHOT_HORIZON_SECONDS: u32 = 2 * 86_400;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Stop {
@@ -17,6 +15,10 @@ pub struct Stop {
     pub lat: Option<f64>,
     pub lon: Option<f64>,
     pub parent_station: Option<String>,
+    /// Whether any trip of the snapshot horizon stops here (the catalogue
+    /// also lists unserved stops, stations and entrances).
+    #[serde(default)]
+    pub served: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -31,11 +33,12 @@ pub struct Endpoint {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PlanRequest {
-    /// Service date (`YYYY-MM-DD`); must equal the snapshot's service date.
+    /// Local date (`YYYY-MM-DD`) in the time zone of the first `from` stop;
+    /// must lie inside the snapshot horizon.
     pub date: String,
-    /// Earliest departure from the rider's position, in seconds since the
-    /// service date's local midnight. Values ≥ 86400 address the following
-    /// night/day (GTFS-style `25:10:00` = 90600).
+    /// Earliest departure from the rider's position, in seconds since local
+    /// midnight of `date` (values ≥ 86400 address the following days).
+    /// All times in the response use the same reference.
     pub departure: u32,
     pub from: Vec<Endpoint>,
     pub to: Vec<Endpoint>,
@@ -44,6 +47,19 @@ pub struct PlanRequest {
     pub max_transfers: u8,
     #[serde(default = "default_results")]
     pub max_results: usize,
+    /// Journeys arriving later than this after `departure` are not searched.
+    #[serde(default = "default_max_travel")]
+    pub max_travel_seconds: u32,
+    /// Further alternatives must leave the origin at most this long after the
+    /// first (earliest-departing) result.
+    #[serde(default = "default_interval")]
+    pub alternatives_within_seconds: u32,
+}
+fn default_interval() -> u32 {
+    3600
+}
+fn default_max_travel() -> u32 {
+    86_400
 }
 fn default_transfers() -> u8 {
     3
@@ -122,55 +138,19 @@ pub struct Leg {
 #[derive(Debug, Serialize)]
 pub struct Stats {
     pub snapshot_dir: String,
-    pub service_date: String,
-    pub timezone: String,
+    pub first_day: String,
+    pub horizon_days: u32,
+    pub feeds_imported: usize,
+    pub feeds_failed: usize,
     pub stops: usize,
     pub routes: usize,
-    pub raptor_routes: usize,
     pub trips: usize,
+    pub gtfs_trips: usize,
+    pub bitfields: usize,
     pub footpaths: usize,
-    /// `strict`, or `conservative (…)` when relaxing transfer rules were dropped.
-    pub transfer_rules: String,
-    pub timetable_file_bytes: u64,
-    /// Portion of the timetable file kept mapped (not decoded into heap).
+    pub specific_transfer_rules: usize,
+    pub disk_bytes: u64,
+    /// Bytes reachable through read-only mappings (page cache, not heap).
     pub mapped_bytes: u64,
-    pub metadata_bytes: u64,
     pub process_memory: Option<crate::memory::ProcessMemory>,
-}
-
-/// GTFS route data shared by all RAPTOR routes split from it.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct RouteInfo {
-    pub route_id: String,
-    pub line: String,
-    pub mode: String,
-}
-
-pub(crate) const METADATA_VERSION: u32 = 2;
-
-#[derive(Debug, Serialize, Deserialize)]
-pub(crate) struct Metadata {
-    pub version: u32,
-    pub rustis_version: String,
-    pub service_date: String,
-    pub timezone: String,
-    pub source: String,
-    /// Whether footpaths may be chained (false) or are a closed relation (true).
-    pub footpaths_closed: bool,
-    pub walk_radius_m: Option<f64>,
-    pub n_raptor_routes: usize,
-    pub n_trips: usize,
-    pub timetable_bytes: u64,
-    /// FNV-1a 64 over the whole timetable file (checked by `verify`).
-    pub timetable_fnv64: String,
-    pub import_notes: Vec<String>,
-    /// `strict`: every transfers.txt rule is enforced. `conservative`: relaxing
-    /// rules were dropped (results valid, possibly incomplete).
-    pub transfer_mode: String,
-    pub dropped_transfer_rules: std::collections::BTreeMap<String, usize>,
-    #[serde(default)]
-    pub excluded_trips: std::collections::BTreeMap<String, usize>,
-    pub default_change_seconds: u32,
-    pub stops: Vec<Stop>,
-    pub routes: Vec<RouteInfo>,
 }

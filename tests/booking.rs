@@ -1,13 +1,13 @@
 //! Demand-responsive stops (GTFS pickup/drop_off type 2/3) and unknown values.
 use rustis::{
-    Endpoint, ImportOptions, LegKind, PlanRequest, PlanResponse, Snapshot, import_gtfs_with,
+    BuildOptions, Endpoint, LegKind, PlanRequest, PlanResponse, Snapshot, import_gtfs_with,
 };
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
 /// Adds trip BOOK (A 08:01 → C 08:18) with the given pickup type at A and
 /// drop-off type at C. It beats every regular journey (08:25 / 08:40).
-fn import(pickup: &str, drop_off: &str, opts: &ImportOptions) -> (TempDir, Snapshot) {
+fn import(pickup: &str, drop_off: &str, opts: &BuildOptions) -> (TempDir, Snapshot) {
     let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tiny");
     let tmp = TempDir::new().unwrap();
     let out: PathBuf = tmp.path().join("feed");
@@ -56,6 +56,8 @@ fn plan(s: &Snapshot) -> PlanResponse {
             }],
             max_transfers: 3,
             max_results: 10,
+            max_travel_seconds: 86_400,
+            alternatives_within_seconds: 3600,
         })
         .unwrap();
     assert_eq!(r.omitted_unreconstructable, 0);
@@ -76,7 +78,7 @@ fn first_trip(r: &PlanResponse) -> &str {
 #[test]
 fn booking_pickup_is_routed_but_marked() {
     for code in ["2", "3"] {
-        let (_t, s) = import(code, "0", &ImportOptions::for_date("2026-11-16"));
+        let (_t, s) = import(code, "0", &BuildOptions::for_date("2026-11-16"));
         let r = plan(&s);
         assert_eq!(first_trip(&r), "BOOK");
         let it = &r.itineraries[0];
@@ -95,7 +97,7 @@ fn booking_pickup_is_routed_but_marked() {
 
 #[test]
 fn booking_drop_off_is_marked() {
-    let (_t, s) = import("0", "3", &ImportOptions::for_date("2026-11-16"));
+    let (_t, s) = import("0", "3", &BuildOptions::for_date("2026-11-16"));
     let r = plan(&s);
     let leg = r.itineraries[0]
         .legs
@@ -108,7 +110,7 @@ fn booking_drop_off_is_marked() {
 
 #[test]
 fn booking_stops_can_be_excluded() {
-    let mut o = ImportOptions::for_date("2026-11-16");
+    let mut o = BuildOptions::for_date("2026-11-16");
     o.exclude_booking_stops = true;
     for (p, d) in [("2", "0"), ("0", "2"), ("3", "0"), ("0", "3")] {
         let (_t, s) = import(p, d, &o);
@@ -121,7 +123,7 @@ fn booking_stops_can_be_excluded() {
 
 #[test]
 fn regular_journeys_have_no_booking_warning() {
-    let (_t, s) = import("1", "0", &ImportOptions::for_date("2026-11-16"));
+    let (_t, s) = import("1", "0", &BuildOptions::for_date("2026-11-16"));
     let r = plan(&s);
     assert_ne!(first_trip(&r), "BOOK");
     assert!(r.warnings.is_empty() && r.itineraries.iter().all(|i| !i.booking_required));

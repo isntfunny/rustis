@@ -8,7 +8,7 @@
 //! * no itinerary may beat it (that would mean a rule was violated);
 //! * without change times, Rustis must match it exactly (completeness);
 //! * with change times, the conservative gap is counted and reported.
-use rustis::{Endpoint, ImportOptions, LegKind, PlanRequest, Snapshot, import_gtfs_with};
+use rustis::{BuildOptions, Endpoint, LegKind, PlanRequest, Snapshot, import_gtfs_with};
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BinaryHeap};
 use std::fmt::Write as _;
@@ -171,7 +171,7 @@ fn write_gtfs(net: &Net, dir: &std::path::Path) {
 
 /// Exact-rule earliest arrival with at least one vehicle (RAPTOR returns no
 /// walk-only journeys). Modes: 0 on foot, never ridden; 1 just alighted;
-/// 2 on foot after riding.
+/// 2 on foot after riding. Walks use the closed footpath relation.
 /// Returns `None` if the target is reachable on foot alone (not compared).
 fn brute_force(net: &Net, from: usize, to: usize, depart: u32) -> Option<Option<u32>> {
     let mut best = vec![[u32::MAX; 3]; net.n_stops];
@@ -187,17 +187,27 @@ fn brute_force(net: &Net, from: usize, to: usize, depart: u32) -> Option<Option<
             heap.push(Reverse((t, s, m)));
         }
     };
+    // Footpaths form a closed relation (as built by the importer): one walk
+    // from the origin, one after each ride, never chained.
+    let closure: Vec<Vec<(usize, u32)>> = (0..net.n_stops)
+        .map(|a| {
+            (0..net.n_stops)
+                .filter(|&b| b != a)
+                .filter_map(|b| walk_time(net, a, b).map(|w| (b, w)))
+                .collect()
+        })
+        .collect();
     while let Some(Reverse((t, s, m))) = heap.pop() {
         if t > best[s][m] {
             continue;
         }
-        for (&(a, b), &w) in &net.foot {
-            if a == s {
+        if m == 1 || (m == 0 && s == from) {
+            for &(b, w) in &closure[s] {
                 relax(&mut heap, &mut best, b, if m == 0 { 0 } else { 2 }, t + w);
             }
         }
         let ready = t + if m == 1 { net.change[s] } else { 0 };
-        for day in [0, 86_400] {
+        for day in [0, 86_400, 2 * 86_400, 3 * 86_400, 4 * 86_400] {
             for trip in &net.trips {
                 let Some(i) = trip.stops.iter().position(|&x| x == s) else {
                     continue;
@@ -224,6 +234,29 @@ fn stop_no(id: &str) -> usize {
     id[1..].parse().unwrap()
 }
 
+/// Footpath duration Rustis must use: the pair's own transfers.txt row, else
+/// the shortest chain of footpaths (the relation is closed at import).
+fn walk_time(net: &Net, from: usize, to: usize) -> Option<u32> {
+    if let Some(&w) = net.foot.get(&(from, to)) {
+        return Some(w);
+    }
+    let mut dist = vec![u32::MAX; net.n_stops];
+    let mut heap = BinaryHeap::from([Reverse((0u32, from))]);
+    dist[from] = 0;
+    while let Some(Reverse((d, s))) = heap.pop() {
+        if d > dist[s] {
+            continue;
+        }
+        for (&(a, b), &w) in &net.foot {
+            if a == s && d + w < dist[b] {
+                dist[b] = d + w;
+                heap.push(Reverse((d + w, b)));
+            }
+        }
+    }
+    (dist[to] != u32::MAX).then_some(dist[to])
+}
+
 /// Replays an itinerary against the generated timetable.
 fn check(net: &Net, it: &rustis::Itinerary, depart: u32, ctx: &str) {
     let mut t = depart;
@@ -235,8 +268,8 @@ fn check(net: &Net, it: &rustis::Itinerary, depart: u32, ctx: &str) {
         match l.kind {
             LegKind::Walk => {
                 assert_eq!(
-                    Some(&l.duration_seconds),
-                    net.foot.get(&(from, to)),
+                    Some(l.duration_seconds),
+                    walk_time(net, from, to),
                     "{ctx}: walk {from}->{to}"
                 );
                 alighted = None;
@@ -255,8 +288,13 @@ fn check(net: &Net, it: &rustis::Itinerary, depart: u32, ctx: &str) {
                 );
                 let day = l.departure - trip.dep[i];
                 assert!(
-                    day == 0 || day == 86_400,
-                    "{ctx}: departure not on a service day"
+                    day % 86_400 == 0,
+                    "{ctx}: departure not on a service day: leg {} dep {} trip {} {:?} {:?}",
+                    l.trip_id.as_deref().unwrap_or(""),
+                    l.departure,
+                    trip.id,
+                    trip.dep,
+                    trip.stops
                 );
                 assert_eq!(
                     (l.departure, l.arrival),
@@ -289,7 +327,11 @@ fn run(with_change_times: bool, seeds: std::ops::Range<u64>) -> (usize, usize, u
         import_gtfs_with(
             &tmp.path().join("feed"),
             &dest,
-            &ImportOptions::for_date("2026-11-16"),
+            &BuildOptions {
+                // the reference chains footpaths without a length cap
+                max_footpath_secs: u32::MAX / 4,
+                ..BuildOptions::for_date("2026-11-16")
+            },
         )
         .unwrap();
         let snap = Snapshot::open(&dest).unwrap();
@@ -314,6 +356,8 @@ fn run(with_change_times: bool, seeds: std::ops::Range<u64>) -> (usize, usize, u
                         }],
                         max_transfers: 8,
                         max_results: 10,
+                        max_travel_seconds: 4 * 86_400,
+                        alternatives_within_seconds: 3600,
                     });
                     let r = r.unwrap_or_else(|e| panic!("{ctx}: {e}"));
                     assert_eq!(r.omitted_unreconstructable, 0, "{ctx}");

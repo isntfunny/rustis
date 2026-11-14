@@ -1,16 +1,20 @@
-//! Rustis: GTFS → immutable disk snapshot → Vulture RAPTOR routing.
+//! Rustis: GTFS feeds → immutable memory-mapped snapshot → RAPTOR with lower-bound pruning.
+pub mod build;
+mod catalog;
+mod engine;
+mod feed;
 pub mod format;
 pub mod http;
-mod import;
+pub mod inventory;
 pub mod memory;
 mod model;
-mod prefilter;
-mod routing;
-mod storage;
+mod raptor;
+pub mod store;
+mod tt;
 
-pub use import::{ImportOptions, ImportReport, import_gtfs, import_gtfs_with};
+pub use build::{BuildOptions, FeedReport, FeedSpec, SnapshotMeta};
+pub use engine::{Snapshot, build_snapshot, import_gtfs, import_gtfs_with};
 pub use model::*;
-pub use storage::Snapshot;
 
 /// Errors from serving APIs: client mistakes vs. internal failures.
 #[derive(Debug)]

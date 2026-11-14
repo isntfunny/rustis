@@ -38,6 +38,15 @@ fn request() -> PlanRequest {
         }],
         max_transfers: 3,
         max_results: 5,
+        max_travel_seconds: 86_400,
+        alternatives_within_seconds: 3600,
+    }
+}
+
+fn request_on(date: &str) -> PlanRequest {
+    PlanRequest {
+        date: date.into(),
+        ..request()
     }
 }
 
@@ -209,8 +218,10 @@ fn next_day_trips_are_routable_when_service_runs() {
     assert_eq!(r.itineraries[0].arrival_time, "2026-11-17T08:25:00+01:00");
 }
 
+/// transfers.txt footpaths are closed transitively at import (up to
+/// `max_footpath_secs`): B→X→D becomes one 120 s walk B→D.
 #[test]
-fn multi_hop_footpaths_are_reconstructed_as_separate_walk_legs() {
+fn multi_hop_footpaths_are_closed_into_one_walk_leg() {
     let (_tmp, s) = import_feed(&[
         (
             "stops.txt",
@@ -236,10 +247,7 @@ fn multi_hop_footpaths_are_reconstructed_as_separate_walk_legs() {
             )
         })
         .collect();
-    assert_eq!(
-        walks,
-        [("B", "X", 8 * 3600 + 660), ("X", "D", 8 * 3600 + 720)]
-    );
+    assert_eq!(walks, [("B", "D", 8 * 3600 + 720)]);
 }
 
 #[test]
@@ -259,9 +267,9 @@ fn equal_time_trips_are_all_exported() {
 fn invalid_requests_fail_explicitly() {
     let (_tmp, s) = imported();
     let mut q = request();
-    q.date = "2026-11-17".into();
+    q.date = "2028-01-01".into();
     let e = s.plan(&q).unwrap_err().to_string();
-    assert!(e.contains("not covered"), "{e}");
+    assert!(e.contains("outside the snapshot horizon"), "{e}");
     q = request();
     q.from[0].stop_id = "missing".into();
     assert!(
@@ -277,7 +285,10 @@ fn invalid_requests_fail_explicitly() {
     q.max_results = 0;
     assert!(s.plan(&q).is_err());
     q = request();
-    q.departure = 48 * 3600;
+    q.departure = 7 * 86_400;
+    assert!(s.plan(&q).is_err());
+    q = request();
+    q.max_travel_seconds = 0;
     assert!(s.plan(&q).is_err());
     q = request();
     q.to.clear();
@@ -290,9 +301,15 @@ fn invalid_requests_fail_explicitly() {
         })
         .collect();
     assert!(s.plan(&q).is_err());
-    assert!(s.stops_in_bbox([50.0, 8.0], [49.0, 9.0], 10).is_err());
-    assert!(s.stops_in_bbox([f64::NAN, 8.0], [51.0, 9.0], 10).is_err());
-    assert!(s.stops_in_bbox([49.0, 7.0], [51.0, 9.0], 0).is_err());
+    assert!(
+        s.stops_in_bbox([50.0, 8.0], [49.0, 9.0], 10, false)
+            .is_err()
+    );
+    assert!(
+        s.stops_in_bbox([f64::NAN, 8.0], [51.0, 9.0], 10, false)
+            .is_err()
+    );
+    assert!(s.stops_in_bbox([49.0, 7.0], [51.0, 9.0], 0, false).is_err());
 }
 
 #[test]
@@ -316,11 +333,11 @@ fn make_writable(p: &Path) {
 fn snapshot_files_are_read_only_and_truncation_is_rejected() {
     let (tmp, s) = imported();
     drop(s);
-    let bin = tmp.path().join("snapshot/timetable.bin");
+    let bin = tmp.path().join("snapshot/dep");
     assert!(std::fs::metadata(&bin).unwrap().permissions().readonly());
     make_writable(&bin);
     let full = std::fs::read(&bin).unwrap();
-    std::fs::write(&bin, &full[..full.len() - 8]).unwrap();
+    std::fs::write(&bin, &full[..full.len() - 4]).unwrap();
     assert!(Snapshot::open(&tmp.path().join("snapshot")).is_err());
     std::fs::write(&bin, [0u8; 3]).unwrap();
     assert!(Snapshot::open(&tmp.path().join("snapshot")).is_err());
@@ -330,11 +347,11 @@ fn snapshot_files_are_read_only_and_truncation_is_rejected() {
 fn corrupted_payload_is_detected_by_verify() {
     let (tmp, s) = imported();
     drop(s);
-    let bin = tmp.path().join("snapshot/timetable.bin");
+    let bin = tmp.path().join("snapshot/gtfs_trip_id.bytes");
     make_writable(&bin);
     let mut data = std::fs::read(&bin).unwrap();
     let n = data.len();
-    data[n - 1] ^= 0xff; // last byte of the trip-id table
+    data[n - 1] ^= 0xff;
     std::fs::write(&bin, data).unwrap();
     let s = Snapshot::open(&tmp.path().join("snapshot")).unwrap();
     assert!(s.verify().unwrap_err().to_string().contains("checksum"));
@@ -344,14 +361,11 @@ fn corrupted_payload_is_detected_by_verify() {
 fn structurally_inconsistent_directory_is_rejected() {
     let (tmp, s) = imported();
     drop(s);
-    let bin = tmp.path().join("snapshot/timetable.bin");
-    make_writable(&bin);
-    let mut data = std::fs::read(&bin).unwrap();
-    // First directory entry's element count (RouteStopOffsets): claim one more.
-    let at = 16 + 16;
-    let count = u64::from_le_bytes(data[at..at + 8].try_into().unwrap());
-    data[at..at + 8].copy_from_slice(&(count + 1).to_le_bytes());
-    std::fs::write(&bin, data).unwrap();
+    let meta = tmp.path().join("snapshot/snapshot.json");
+    make_writable(&meta);
+    let mut v: serde_json::Value = serde_json::from_slice(&std::fs::read(&meta).unwrap()).unwrap();
+    v["n_routes"] = (v["n_routes"].as_u64().unwrap() + 1).into();
+    std::fs::write(&meta, serde_json::to_vec(&v).unwrap()).unwrap();
     assert!(Snapshot::open(&tmp.path().join("snapshot")).is_err());
 }
 
@@ -360,9 +374,9 @@ fn import_never_overwrites_an_existing_snapshot() {
     let tmp = TempDir::new().unwrap();
     let dest = tmp.path().join("snapshot");
     import_gtfs(&fixture(), &dest, "2026-11-16").unwrap();
-    let before = std::fs::read(dest.join("metadata.json")).unwrap();
+    let before = std::fs::read(dest.join("snapshot.json")).unwrap();
     assert!(import_gtfs(&fixture(), &dest, "2026-11-18").is_err());
-    assert_eq!(std::fs::read(dest.join("metadata.json")).unwrap(), before);
+    assert_eq!(std::fs::read(dest.join("snapshot.json")).unwrap(), before);
     let leftovers: Vec<_> = std::fs::read_dir(tmp.path())
         .unwrap()
         .map(|e| e.unwrap().file_name())
@@ -375,33 +389,14 @@ fn import_never_overwrites_an_existing_snapshot() {
 }
 
 #[test]
-fn unsupported_feeds_fail_closed_without_leaving_output() {
+fn feeds_that_cannot_be_imported_fail_closed_without_leaving_output() {
     let cases: &[(&str, &str, &str)] = &[
-        (
-            "frequencies.txt",
-            "trip_id,start_time,end_time,headway_secs\nT1,06:00:00,09:00:00,600\n",
-            "frequency",
-        ),
-        (
-            "transfers.txt",
-            "from_stop_id,to_stop_id,transfer_type,min_transfer_time\nB,D,1,\n",
-            "type 1",
-        ),
-        (
-            "transfers.txt",
-            "from_stop_id,to_stop_id,transfer_type,min_transfer_time,from_trip_id,to_trip_id\nB,D,2,120,T1,T2\n",
-            "trip/route-specific",
-        ),
-        (
-            "transfers.txt",
-            "from_stop_id,to_stop_id,transfer_type\nB,D,4\n",
-            "type 4",
-        ),
         (
             "agency.txt",
             "agency_id,agency_name,agency_url,agency_timezone\ntest,A,https://a.invalid,Europe/Berlin\nother,B,https://b.invalid,Europe/London\n",
-            "timezone",
+            "time zone",
         ),
+        ("stop_times.txt", "", "stop_times.txt missing"),
     ];
     for (file, body, needle) in cases {
         let tmp = TempDir::new().unwrap();
@@ -414,42 +409,105 @@ fn unsupported_feeds_fail_closed_without_leaving_output() {
 }
 
 #[test]
-fn dst_transition_and_inactive_dates_are_rejected() {
+fn local_times_follow_dst_and_dates_outside_the_horizon_are_rejected() {
+    let cal = "service_id,monday,tuesday,wednesday,thursday,friday,saturday,sunday,start_date,end_date\ndaily,1,1,1,1,1,1,1,20261001,20261231\n";
+    let (_tmp, s) = {
+        let tmp = TempDir::new().unwrap();
+        let src = feed(
+            tmp.path(),
+            &[("calendar.txt", cal), ("calendar_dates.txt", "")],
+        );
+        let dest = tmp.path().join("snapshot");
+        import_gtfs(&src, &dest, "2026-10-20").unwrap();
+        let s = Snapshot::open(&dest).unwrap();
+        (tmp, s)
+    };
+    // Summer time ends on Sunday 25.10.2026 at 03:00 CEST.
+    // `departure` counts real seconds since local midnight: 08:00 on the 25-hour
+    // day is 9 h after midnight.
+    for (date, offset, secs) in [
+        ("2026-10-24", "+02:00", 8 * 3600),
+        ("2026-10-25", "+01:00", 9 * 3600),
+        ("2026-10-26", "+01:00", 8 * 3600),
+    ] {
+        let mut q = request();
+        q.date = date.into();
+        let r = s.plan(&q).unwrap();
+        assert_eq!(transit_trips(&r, 0), ["T1", "T2"], "{date}");
+        assert_eq!(r.itineraries[0].departure, secs, "{date}");
+        assert_eq!(
+            r.itineraries[0].legs[0].departure_time,
+            format!("{date}T08:00:00{offset}")
+        );
+    }
+    // The night trip of service day Saturday 24.10. (25:10) runs before the switch.
+    let mut q = request();
+    q.date = "2026-10-24".into();
+    q.departure = 24 * 3600 + 3600;
+    let r = s.plan(&q).unwrap();
+    assert_eq!(transit_trips(&r, 0), ["NIGHT"]);
+    assert_eq!(
+        r.itineraries[0].legs[0].departure_time,
+        "2026-10-25T01:10:00+02:00"
+    );
+    let mut q = request();
+    q.date = "2027-12-01".into();
+    assert!(
+        s.plan(&q)
+            .unwrap_err()
+            .to_string()
+            .contains("outside the snapshot horizon")
+    );
+}
+
+#[test]
+fn feed_without_trips_in_the_horizon_is_imported_and_flagged() {
     let tmp = TempDir::new().unwrap();
-    let err = format!(
-        "{:#}",
-        import_gtfs(&fixture(), &tmp.path().join("a"), "2026-10-24").unwrap_err()
+    let dest = tmp.path().join("snapshot");
+    let m = import_gtfs(&fixture(), &dest, "2027-03-01").unwrap();
+    assert_eq!(m.n_trips, 0);
+    assert!(
+        m.warnings
+            .iter()
+            .any(|w| w.contains("no trips in the horizon")),
+        "{:?}",
+        m.warnings
     );
-    assert!(err.contains("DST"), "{err}");
-    let err = format!(
-        "{:#}",
-        import_gtfs(&fixture(), &tmp.path().join("b"), "2027-03-01").unwrap_err()
+    let s = Snapshot::open(&dest).unwrap();
+    assert!(
+        s.plan(&request_on("2027-03-02"))
+            .unwrap()
+            .itineraries
+            .is_empty()
     );
-    assert!(err.contains("no trips"), "{err}");
 }
 
 #[test]
 fn bbox_search_returns_served_stops_and_respects_limit() {
     let (_tmp, s) = imported();
-    let stops = s.stops_in_bbox([49.99, 7.99], [50.005, 8.005], 10).unwrap();
+    let stops = s
+        .stops_in_bbox([49.99, 7.99], [50.005, 8.005], 10, false)
+        .unwrap();
     assert_eq!(stops.len(), 1);
     assert_eq!(
         (stops[0].stop_id.as_str(), stops[0].name.as_str()),
         ("A", "Origin")
     );
     assert_eq!(
-        s.stops_in_bbox([49.0, 7.0], [51.0, 9.0], 2).unwrap().len(),
+        s.stops_in_bbox([49.0, 7.0], [51.0, 9.0], 2, false)
+            .unwrap()
+            .len(),
         2
     );
     assert_eq!(
-        s.stops_in_bbox([49.0, 7.0], [51.0, 9.0], 100)
+        s.stops_in_bbox([49.0, 7.0], [51.0, 9.0], 100, false)
             .unwrap()
             .len(),
         4
     );
 }
 
-fn import_with(overrides: &[(&str, &str)], opts: &rustis::ImportOptions) -> (TempDir, Snapshot) {
+fn import_with(overrides: &[(&str, &str)], opts: &rustis::BuildOptions) -> (TempDir, Snapshot) {
     let tmp = TempDir::new().unwrap();
     let src = feed(tmp.path(), overrides);
     let dest = tmp.path().join("snapshot");
@@ -463,25 +521,22 @@ fn dropped_trip_specific_transfers_never_become_footpaths() {
     // Vulture alone would turn this guaranteed-connection row into a 300 s
     // B→D footpath; Rustis must drop it entirely in degraded mode.
     let transfers = "from_stop_id,to_stop_id,transfer_type,min_transfer_time,from_trip_id,to_trip_id\nB,D,1,,T1,T2\n";
-    let mut opts = rustis::ImportOptions::for_date("2026-11-16");
-    opts.drop_relaxing_transfers = true;
+    let opts = rustis::BuildOptions::for_date("2026-11-16");
     let (_tmp, s) = import_with(&[("transfers.txt", transfers)], &opts);
     let r = s.plan(&request()).unwrap();
     assert_eq!(r.itineraries.len(), 1);
     assert_eq!(transit_trips(&r, 0), ["SLOW"]);
     assert!(
-        s.import_notes()
-            .iter()
-            .any(|n| n.starts_with("CONSERVATIVE")),
+        r.warnings.iter().any(|w| w.contains("not exploited")),
         "{:?}",
-        s.import_notes()
+        r.warnings
     );
 }
 
 #[test]
 fn walk_radius_adds_footpaths_but_respects_impossible_transfers() {
-    let mut opts = rustis::ImportOptions::for_date("2026-11-16");
-    opts.walk_radius_m = Some(500.0);
+    let mut opts = rustis::BuildOptions::for_date("2026-11-16");
+    opts.link_radius_m = 500.0;
     let no_rules = "from_stop_id,to_stop_id,transfer_type,min_transfer_time\n";
     let (_tmp, s) = import_with(&[("transfers.txt", no_rules)], &opts);
     let r = s.plan(&request()).unwrap();

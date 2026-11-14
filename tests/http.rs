@@ -72,7 +72,7 @@ async fn health_stats_and_bbox_endpoints() {
     let (_tmp, app) = app();
     let (status, json) = call(&app, get("/health")).await;
     assert_eq!(
-        (status, json["service_date"].as_str()),
+        (status, json["first_day"].as_str()),
         (StatusCode::OK, Some("2026-11-16"))
     );
     let (status, json) = call(&app, get("/v1/stats")).await;

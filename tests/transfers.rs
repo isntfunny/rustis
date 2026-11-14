@@ -1,5 +1,5 @@
-//! Transfer-rule correctness: minimum change times, forbidden transfers and
-//! the conservative `drop_relaxing_transfers` mode.
+//! Transfer-rule correctness: minimum change times, forbidden transfers,
+//! trip/route-specific rules and rules that are deliberately not exploited.
 //!
 //! Base network (tests/fixtures/tiny) plus a fast feeder at B:
 //!   T1  A 08:00 → B 08:10
@@ -7,7 +7,7 @@
 //!   T2  D 08:15 → C 08:25   (B→D footpath when transfers.txt provides one)
 //!   SLOW A 08:05 → C 08:40
 use rustis::{
-    Endpoint, ImportOptions, LegKind, PlanRequest, PlanResponse, Snapshot, import_gtfs_with,
+    BuildOptions, Endpoint, LegKind, PlanRequest, PlanResponse, Snapshot, import_gtfs_with,
 };
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
@@ -45,11 +45,11 @@ fn feed(dir: &Path, transfers: &str) -> PathBuf {
     out
 }
 
-fn opts() -> ImportOptions {
-    ImportOptions::for_date("2026-11-16")
+fn opts() -> BuildOptions {
+    BuildOptions::for_date("2026-11-16")
 }
 
-fn try_import(transfers: &str, opts: &ImportOptions) -> (TempDir, anyhow::Result<Snapshot>) {
+fn try_import(transfers: &str, opts: &BuildOptions) -> (TempDir, anyhow::Result<Snapshot>) {
     let tmp = TempDir::new().unwrap();
     let src = feed(tmp.path(), transfers);
     let dest = tmp.path().join("snapshot");
@@ -60,16 +60,9 @@ fn try_import(transfers: &str, opts: &ImportOptions) -> (TempDir, anyhow::Result
     (tmp, r)
 }
 
-fn import(transfers: &str, opts: &ImportOptions) -> (TempDir, Snapshot) {
+fn import(transfers: &str, opts: &BuildOptions) -> (TempDir, Snapshot) {
     let (tmp, r) = try_import(transfers, opts);
     (tmp, r.unwrap())
-}
-
-fn import_err(transfers: &str, opts: &ImportOptions) -> String {
-    match try_import(transfers, opts).1 {
-        Ok(_) => panic!("import unexpectedly succeeded"),
-        Err(e) => format!("{e:#}"),
-    }
 }
 
 fn plan(s: &Snapshot) -> PlanResponse {
@@ -87,6 +80,8 @@ fn plan(s: &Snapshot) -> PlanResponse {
             }],
             max_transfers: 3,
             max_results: 10,
+            max_travel_seconds: 86_400,
+            alternatives_within_seconds: 3600,
         })
         .unwrap();
     // The adapter itself must enforce the rules; the reconstruction safety net
@@ -192,15 +187,14 @@ fn zero_change_time_without_rules_is_the_documented_default() {
 }
 
 #[test]
-fn walked_transfer_keeps_its_min_time_and_same_stop_time_only_delays() {
+fn walked_transfer_keeps_its_min_time_and_same_stop_time_does_not_delay_it() {
     // B→D needs 120 s; T2 at D 08:15 is reachable (08:10 + 120 ≤ 08:15).
     let (_t, s) = import(&format!("{HEADER}B,D,2,120\n"), &opts());
     let r = plan(&s);
     assert_eq!(trips(&r)[0], ["T1", "T3"]);
     assert_changes_valid(&r, |_| 0, |a, b| (a == "B" && b == "D").then_some(120));
-    // With a 300 s same-stop rule at B the change to T3 is forbidden. The
-    // adapter conservatively also delays walking off at B, so T2 is missed:
-    // that loses a connection, never admits an invalid one.
+    // A 300 s same-stop rule at B forbids the change to T3, but walking off to
+    // D is governed by the B→D rule alone: T1 → T2 stays possible (exact).
     let (_t, s) = import(&format!("{HEADER}B,B,2,300\nB,D,2,120\n"), &opts());
     let r = plan(&s);
     assert_changes_valid(
@@ -209,6 +203,7 @@ fn walked_transfer_keeps_its_min_time_and_same_stop_time_only_delays() {
         |a, b| (a == "B" && b == "D").then_some(120),
     );
     assert!(!trips(&r).contains(&vec!["T1".into(), "T3".into()]));
+    assert_eq!(trips(&r)[0], ["T1", "T2"]);
 }
 
 #[test]
@@ -222,46 +217,78 @@ fn duplicate_rules_use_the_strictest_time() {
 }
 
 #[test]
-fn forbidden_transfers_are_enforced_or_rejected() {
-    // Distinct stops: no footpath, also not from --walk-radius-m.
+fn forbidden_transfers_are_enforced() {
+    // Distinct stops: no footpath, also not from generated links.
     let mut o = opts();
-    o.walk_radius_m = Some(500.0);
+    o.link_radius_m = 500.0;
     let (_t, s) = import(&format!("{HEADER}B,D,3,\n"), &o);
-    assert!(!trips(&plan(&s)).contains(&vec!["T1".into(), "T2".into()]));
-    // Same stop: the adapter cannot forbid boarding at the arrival stop.
-    let e = import_err(&format!("{HEADER}B,B,3,\n"), &opts());
-    assert!(e.contains("same-stop transfer_type 3"), "{e}");
-    // Reachable through chained footpaths: would circumvent the rule.
-    let e = import_err(&format!("{HEADER}B,X,2,30\nX,D,2,30\nB,D,3,\n"), &opts()).to_string();
-    assert!(e.contains("X") || e.contains("chain"), "{e}");
+    let r = plan(&s);
+    assert!(
+        !trips(&r).contains(&vec!["T1".into(), "T2".into()]),
+        "{:?}",
+        trips(&r)
+    );
+    // Same stop: no change at B at all (T1 → T3 impossible).
+    let (_t, s) = import(&format!("{HEADER}B,B,3,\n"), &opts());
+    let r = plan(&s);
+    assert!(
+        !trips(&r).contains(&vec!["T1".into(), "T3".into()]),
+        "{:?}",
+        trips(&r)
+    );
 }
 
 #[test]
-fn min_time_rule_without_time_is_rejected() {
-    let e = import_err(&format!("{HEADER}B,D,2,\n"), &opts());
-    assert!(e.contains("min_transfer_time"), "{e}");
+fn min_time_rule_without_time_uses_the_walking_time() {
+    // B→D ≈ 110 m straight line at 1.2 m/s ≈ 92 s: T1 (B 08:10) → T2 (D 08:15).
+    // (Changing at B itself is forbidden so T1 → T3 cannot win.)
+    let (_t, s) = import(&format!("{HEADER}B,D,2,\nB,B,3,\n"), &opts());
+    let r = plan(&s);
+    assert!(
+        trips(&r).contains(&vec!["T1".into(), "T2".into()]),
+        "{:?}",
+        trips(&r)
+    );
 }
 
+const SPECIFIC: &str = "from_stop_id,to_stop_id,transfer_type,min_transfer_time,from_trip_id,to_trip_id,from_route_id,to_route_id\n";
+
 #[test]
-fn restricting_trip_specific_rules_are_rejected_even_in_conservative_mode() {
-    let mut o = opts();
-    o.drop_relaxing_transfers = true;
-    let h = "from_stop_id,to_stop_id,transfer_type,min_transfer_time,from_trip_id,to_trip_id,from_route_id,to_route_id\n";
+fn trip_and_route_specific_restrictions_are_enforced() {
     for row in [
         "B,B,2,600,T1,T3,,",
         "B,B,3,,T1,T3,,",
         "B,B,2,600,,,R1,R3",
         "B,B,3,,,,R1,R3",
+        "B,B,3,,T1,,,R3",
     ] {
-        let e = import_err(&format!("{h}{row}\n"), &o);
-        assert!(e.contains("cannot be enforced"), "{row}: {e}");
-        let e = import_err(&format!("{h}{row}\n"), &opts());
-        assert!(e.contains("not supported"), "{row}: {e}");
+        let (_t, s) = import(&format!("{SPECIFIC}{row}\n"), &opts());
+        let r = plan(&s);
+        assert_eq!(trips(&r), [["SLOW"]], "{row}");
     }
+    // A rule for other trips does not affect T1 → T3.
+    let (_t, s) = import(&format!("{SPECIFIC}B,B,3,,SLOW,T3,,\n"), &opts());
+    assert_eq!(trips(&plan(&s))[0], ["T1", "T3"]);
 }
 
 #[test]
-fn relaxing_rules_are_rejected_by_default_and_dropped_only_on_request() {
+fn the_most_specific_rule_wins_also_when_it_is_shorter() {
+    // Stop-level 300 s at B, but T1 → T3 explicitly needs only 60 s.
+    let (_t, s) = import(
+        &format!("{SPECIFIC}B,B,2,300,,,,\nB,B,2,60,T1,T3,,\n"),
+        &opts(),
+    );
+    assert_eq!(trips(&plan(&s))[0], ["T1", "T3"]);
+    // Trip pair beats route pair.
+    let (_t, s) = import(
+        &format!("{SPECIFIC}B,B,3,,,,R1,R3\nB,B,2,60,T1,T3,,\n"),
+        &opts(),
+    );
+    assert_eq!(trips(&plan(&s))[0], ["T1", "T3"]);
+}
+
+#[test]
+fn relaxing_rules_are_not_exploited_and_flagged() {
     let h = "from_stop_id,to_stop_id,transfer_type,min_transfer_time,from_trip_id,to_trip_id\n";
     for row in [
         "B,D,1,,T1,T2",
@@ -271,29 +298,22 @@ fn relaxing_rules_are_rejected_by_default_and_dropped_only_on_request() {
         "B,D,1,,,",
         "B,B,4,,,",
     ] {
-        let e = import_err(&format!("{h}{row}\n"), &opts());
-        assert!(e.contains("not supported"), "{row}: {e}");
+        let (_t, s) = import(&format!("{h}{row}\nB,B,2,300,,\n"), &opts());
+        let r = plan(&s);
+        // Never turned into a footpath or a shorter change.
+        assert_eq!(trips(&r), [["SLOW"]], "{row}");
+        assert!(
+            r.warnings.iter().any(|w| w.contains("not exploited")),
+            "{row}: {:?}",
+            r.warnings
+        );
     }
-    let mut o = opts();
-    o.drop_relaxing_transfers = true;
-    let (_t, s) = import(&format!("{h}B,D,1,,T1,T2\nB,B,2,300,,\n"), &o);
-    let r = plan(&s);
-    // Dropping the guaranteed connection must not create a B→D footpath, and
-    // the kept same-stop rule still applies.
-    assert_eq!(trips(&r), [["SLOW"]]);
-    assert!(
-        r.warnings.iter().any(|w| w.contains("dropped")),
-        "{:?}",
-        r.warnings
-    );
-    assert!(s.stats().transfer_rules.contains("conservative"));
 }
 
 #[test]
-fn strict_snapshots_carry_no_warning() {
-    let (_t, s) = import(HEADER, &opts());
+fn fully_modelled_snapshots_carry_no_warning() {
+    let (_t, s) = import(&format!("{HEADER}B,B,2,60\nB,D,2,120\n"), &opts());
     assert!(plan(&s).warnings.is_empty());
-    assert_eq!(s.stats().transfer_rules, "strict");
 }
 
 #[test]
@@ -315,6 +335,8 @@ fn origin_walks_are_not_delayed_by_the_origin_change_time() {
             }],
             max_transfers: 0,
             max_results: 3,
+            max_travel_seconds: 86_400,
+            alternatives_within_seconds: 3600,
         })
         .unwrap();
     // T3 (08:12 at B) is boardable from the origin without any change time.
@@ -333,6 +355,8 @@ fn origin_walks_are_not_delayed_by_the_origin_change_time() {
             }],
             max_transfers: 0,
             max_results: 3,
+            max_travel_seconds: 86_400,
+            alternatives_within_seconds: 3600,
         })
         .unwrap();
     assert_eq!(
@@ -349,65 +373,4 @@ fn reported_arrivals_exclude_the_internal_change_time() {
     assert_eq!(trips(&r)[0], ["T1", "T3"]);
     assert_eq!(r.itineraries[0].arrival, H8 + 20 * 60);
     assert_eq!(r.itineraries[0].arrival_time, "2026-11-16T08:20:00+01:00");
-}
-
-fn generalize() -> ImportOptions {
-    let mut o = opts();
-    o.generalize_restricting_transfers = true;
-    o
-}
-
-const SPECIFIC: &str = "from_stop_id,to_stop_id,transfer_type,min_transfer_time,from_trip_id,to_trip_id,from_route_id,to_route_id\n";
-
-#[test]
-fn generalized_route_specific_same_stop_time_applies_to_every_change() {
-    // Only R1→R3 needs 300 s at B; generalised to every change at B.
-    let (_t, s) = import(&format!("{SPECIFIC}B,B,2,300,,,R1,R3\n"), &generalize());
-    let r = plan(&s);
-    assert_eq!(trips(&r), [["SLOW"]]);
-    assert!(
-        r.warnings.iter().any(|w| w.contains("generalised")),
-        "{:?}",
-        r.warnings
-    );
-    assert_changes_valid(&r, |s| if s == "B" { 300 } else { 0 }, |_, _| None);
-    // A more permissive specific time never lowers a stop-level rule.
-    let (_t, s) = import(
-        &format!("{SPECIFIC}B,B,2,300,,,,\nB,B,2,60,,,R1,R3\n"),
-        &generalize(),
-    );
-    assert_eq!(trips(&plan(&s)), [["SLOW"]]);
-}
-
-#[test]
-fn generalized_specific_walk_time_only_tightens_existing_footpaths() {
-    // Stop-level B→D 120 s raised to 600 s: T2 (08:15) no longer reachable.
-    let (_t, s) = import(
-        &format!("{SPECIFIC}B,D,2,120,,,,\nB,D,2,600,,,R1,R2\nC,C,2,600,,,,\n"),
-        &generalize(),
-    );
-    let r = plan(&s);
-    assert!(
-        !trips(&r).contains(&vec!["T1".into(), "T2".into()]),
-        "{:?}",
-        trips(&r)
-    );
-    // Without a stop-level footpath the specific row creates none.
-    let (_t, s) = import(
-        &format!("{SPECIFIC}B,D,2,60,,,R1,R2\nB,B,2,600,,,,\n"),
-        &generalize(),
-    );
-    assert_eq!(trips(&plan(&s)), [["SLOW"]]);
-}
-
-#[test]
-fn generalized_specific_forbidden_transfer_removes_the_footpath() {
-    let (_t, s) = import(
-        &format!("{SPECIFIC}B,D,2,120,,,,\nB,D,3,,T1,T2,,\nB,B,2,600,,,,\n"),
-        &generalize(),
-    );
-    assert_eq!(trips(&plan(&s)), [["SLOW"]]);
-    // Same-stop specific prohibition still cannot be enforced.
-    let e = import_err(&format!("{SPECIFIC}B,B,3,,,,R1,R3\n"), &generalize());
-    assert!(e.contains("cannot be enforced"), "{e}");
 }

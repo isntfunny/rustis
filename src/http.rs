@@ -48,7 +48,7 @@ impl IntoResponse for Error {
 }
 
 async fn health(State(s): State<AppState>) -> Response {
-    Json(json!({ "status": "ok", "service_date": s.snapshot.service_date(), "transfer_rules": s.snapshot.stats().transfer_rules, "warnings": s.snapshot.warnings() })).into_response()
+    Json(json!({ "status": "ok", "first_day": s.snapshot.first_day(), "horizon_days": s.snapshot.meta().horizon_days, "warnings": s.snapshot.warnings() })).into_response()
 }
 
 async fn stats(State(s): State<AppState>) -> Response {
@@ -63,6 +63,9 @@ struct BboxQuery {
     max_lon: f64,
     #[serde(default = "default_limit")]
     limit: usize,
+    /// Only stops served by at least one trip of the horizon.
+    #[serde(default)]
+    served_only: bool,
 }
 fn default_limit() -> usize {
     100
@@ -98,7 +101,12 @@ async fn stops(
         Err(e) => return error(StatusCode::BAD_REQUEST, e.body_text()),
     };
     match run_blocking(&s, move |snap| {
-        snap.stops_in_bbox([q.min_lat, q.min_lon], [q.max_lat, q.max_lon], q.limit)
+        snap.stops_in_bbox(
+            [q.min_lat, q.min_lon],
+            [q.max_lat, q.max_lon],
+            q.limit,
+            q.served_only,
+        )
     })
     .await
     {

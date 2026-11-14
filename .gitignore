@@ -2,3 +2,4 @@
 /local/
 /data/
 *.tmp
+__pycache__/

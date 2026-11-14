@@ -1,11 +1,14 @@
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use rustis::{Endpoint, ImportOptions, PlanRequest, Snapshot, import_gtfs_with};
+use rustis::{BuildOptions, Endpoint, FeedSpec, PlanRequest, Snapshot, build_snapshot};
 use std::path::PathBuf;
 use std::sync::Arc;
 
 #[derive(Parser)]
-#[command(version, about = "Disk-backed GTFS routing prototype (Vulture RAPTOR)")]
+#[command(
+    version,
+    about = "Disk-backed GTFS routing (RAPTOR with lower-bound pruning over mmap snapshots)"
+)]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -13,48 +16,41 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Import one GTFS feed (directory or ZIP) into a new snapshot directory.
-    Import {
+    /// Build a snapshot from GTFS feeds (directories or ZIPs).
+    Build {
+        /// A feed; repeatable. With a single --gtfs, ids stay unprefixed;
+        /// otherwise they are namespaced by file stem.
         #[arg(long)]
-        gtfs: PathBuf,
+        gtfs: Vec<PathBuf>,
+        /// MOTIS config.yml: import all of its datasets (namespace = dataset name).
+        #[arg(long)]
+        motis_config: Option<PathBuf>,
+        /// Directory holding the dataset files (with --motis-config).
+        #[arg(long)]
+        feed_dir: Option<PathBuf>,
+        /// Only datasets whose name matches one of these prefixes (development).
+        #[arg(long)]
+        only: Vec<String>,
         #[arg(long)]
         out: PathBuf,
-        /// Service date YYYY-MM-DD (the following day is included for overnight trips).
+        /// First service day YYYY-MM-DD (default: today).
         #[arg(long)]
-        date: String,
-        /// Add straight-line footpaths between stops within this many metres.
-        #[arg(long)]
-        walk_radius_m: Option<f64>,
+        first_day: Option<String>,
+        #[arg(long, default_value_t = 366)]
+        horizon_days: u32,
+        /// Generate footpaths between served stops closer than this (0 = off).
+        #[arg(long, default_value_t = 0.0)]
+        link_radius_m: f64,
         #[arg(long, default_value_t = 1.2)]
         walk_speed: f64,
-        /// Drop transfer rules whose omission can only remove connections
-        /// (timed/in-seat/recommended, also trip/route-specific). Restricting
-        /// rules (specific min-time or forbidden) are always rejected. The
-        /// snapshot and every response are marked as possibly incomplete.
-        #[arg(long)]
-        drop_relaxing_transfers: bool,
-        /// Apply trip/route-specific min-time/forbidden rules to all trips at
-        /// those stops (only tightens; marks the snapshot conservative).
-        #[arg(long)]
-        generalize_restricting_transfers: bool,
+        #[arg(long, default_value_t = 720)]
+        max_footpath_secs: u32,
         /// Minimum change time (s) at stops without a same-stop transfers.txt rule.
         #[arg(long, default_value_t = 0)]
         default_change_seconds: u32,
-        /// Exclude boarding/alighting that needs booking (pickup/drop_off 2/3)
-        /// instead of returning it marked `booking_required`.
+        /// Treat pickup/drop_off 2/3 (booking) as not available.
         #[arg(long)]
         exclude_booking_stops: bool,
-        /// Parse the full feed instead of stream-filtering it to the snapshot days.
-        #[arg(long)]
-        no_prefilter: bool,
-        /// Remove GTFS-Flex trips (on-demand zones/windows) instead of failing;
-        /// the snapshot and every response are marked incomplete.
-        #[arg(long)]
-        exclude_flex_trips: bool,
-        /// Remove frequency-based trips (frequencies.txt) instead of failing;
-        /// the snapshot and every response are marked incomplete.
-        #[arg(long)]
-        exclude_frequency_trips: bool,
     },
     /// Plan a journey against a snapshot.
     Plan {
@@ -75,6 +71,8 @@ enum Cmd {
         max_transfers: u8,
         #[arg(long, default_value_t = 3)]
         max_results: usize,
+        #[arg(long, default_value_t = 86_400)]
+        max_travel_seconds: u32,
     },
     /// List served stops inside a bounding box.
     Stops {
@@ -85,6 +83,8 @@ enum Cmd {
         bbox: String,
         #[arg(long, default_value_t = 20)]
         limit: usize,
+        #[arg(long)]
+        served_only: bool,
     },
     /// Print snapshot statistics and this process's memory.
     Stats {
@@ -95,6 +95,17 @@ enum Cmd {
     Verify {
         #[arg(long)]
         snapshot: PathBuf,
+    },
+    /// Read-only inventory of all datasets of a MOTIS config (JSON lines).
+    Inventory {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        feeds: PathBuf,
+        #[arg(long)]
+        out: PathBuf,
+        #[arg(long, default_value_t = 2)]
+        jobs: usize,
     },
     /// Serve the HTTP API.
     Serve {
@@ -140,42 +151,86 @@ fn print(v: &impl serde::Serialize) -> Result<()> {
 
 fn main() -> Result<()> {
     match Cli::parse().cmd {
-        Cmd::Import {
+        Cmd::Build {
             gtfs,
+            motis_config,
+            feed_dir,
+            only,
             out,
-            date,
-            walk_radius_m,
+            first_day,
+            horizon_days,
+            link_radius_m,
             walk_speed,
-            drop_relaxing_transfers,
-            generalize_restricting_transfers,
+            max_footpath_secs,
             default_change_seconds,
             exclude_booking_stops,
-            no_prefilter,
-            exclude_flex_trips,
-            exclude_frequency_trips,
         } => {
-            let opts = ImportOptions {
-                date,
-                walk_radius_m,
-                walk_speed_m_per_s: walk_speed,
-                drop_relaxing_transfers,
-                generalize_restricting_transfers,
-                default_change_seconds,
-                exclude_booking_stops,
-                prefilter: !no_prefilter,
-                exclude_flex_trips,
-                exclude_frequency_trips,
-            };
-            let r = import_gtfs_with(&gtfs, &out, &opts)?;
-            println!(
-                "imported {} stops, {} RAPTOR routes, {} trips; timetable.bin {} bytes, metadata.json {} bytes",
-                r.stops, r.raptor_routes, r.trips, r.timetable_bytes, r.metadata_bytes
-            );
-            for n in r.notes {
-                println!("note: {n}");
+            let mut feeds: Vec<FeedSpec> = Vec::new();
+            if let Some(cfg) = motis_config {
+                let dir = feed_dir.context("--feed-dir is required with --motis-config")?;
+                for (name, path) in
+                    rustis::inventory::motis_datasets(&std::fs::read_to_string(cfg)?)
+                {
+                    if only.is_empty() || only.iter().any(|o| name.starts_with(o.as_str())) {
+                        let file = std::path::Path::new(&path)
+                            .file_name()
+                            .context("dataset path")?
+                            .to_owned();
+                        feeds.push(FeedSpec {
+                            name,
+                            path: dir.join(file),
+                        });
+                    }
+                }
             }
-            if let Some(m) = rustis::memory::ProcessMemory::current() {
-                println!("import peak RSS (VmHWM): {} KiB", m.hwm_kib);
+            let single = gtfs.len() == 1 && feeds.is_empty();
+            for g in gtfs {
+                let name = if single {
+                    String::new()
+                } else {
+                    g.file_stem()
+                        .map(|s| s.to_string_lossy().trim_end_matches(".gtfs").to_owned())
+                        .unwrap_or_default()
+                };
+                feeds.push(FeedSpec { name, path: g });
+            }
+            if feeds.is_empty() {
+                bail!("no feeds given (--gtfs or --motis-config)");
+            }
+            let first_day = match first_day {
+                Some(d) => jiff::civil::Date::strptime("%Y-%m-%d", &d)?,
+                None => jiff::Zoned::now().date(),
+            };
+            let mut opts = BuildOptions::new(first_day);
+            opts.horizon_days = horizon_days;
+            opts.link_radius_m = link_radius_m;
+            opts.walk_speed_m_per_s = walk_speed;
+            opts.max_footpath_secs = max_footpath_secs;
+            opts.default_change_seconds = default_change_seconds;
+            opts.exclude_booking_stops = exclude_booking_stops;
+            let m = build_snapshot(&feeds, &out, opts)?;
+            let failed: Vec<_> = m.feeds.iter().filter(|f| !f.imported).collect();
+            println!(
+                "built {}: {} feeds ({} failed), {} stops, {} routes, {} trips, {} bitfields, {} footpaths, {} specific rules in {:.0}s",
+                out.display(),
+                m.feeds.len(),
+                failed.len(),
+                m.n_stops,
+                m.n_routes,
+                m.n_trips,
+                m.n_bitfields,
+                m.n_footpaths,
+                m.n_specific_rules,
+                m.build_seconds
+            );
+            for f in failed {
+                println!("failed: {} ({})", f.name, f.error.as_deref().unwrap_or(""));
+            }
+            for w in &m.warnings {
+                println!("warning: {w}");
+            }
+            if let Some(mem) = rustis::memory::ProcessMemory::current() {
+                println!("build peak RSS (VmHWM): {} MiB", mem.hwm_kib / 1024);
             }
         }
         Cmd::Plan {
@@ -186,6 +241,7 @@ fn main() -> Result<()> {
             to,
             max_transfers,
             max_results,
+            max_travel_seconds,
         } => {
             let s = Snapshot::open(&snapshot)?;
             let req = PlanRequest {
@@ -195,6 +251,8 @@ fn main() -> Result<()> {
                 to: to.iter().map(|e| endpoint(e)).collect::<Result<_>>()?,
                 max_transfers,
                 max_results,
+                max_travel_seconds,
+                alternatives_within_seconds: 3600,
             };
             let t = std::time::Instant::now();
             let resp = s.plan(&req)?;
@@ -205,6 +263,7 @@ fn main() -> Result<()> {
             snapshot,
             bbox,
             limit,
+            served_only,
         } => {
             let v: Vec<f64> = bbox
                 .split(',')
@@ -214,8 +273,19 @@ fn main() -> Result<()> {
             let [a, b, c, d] = v[..] else {
                 bail!("bbox needs four numbers")
             };
-            print(&Snapshot::open(&snapshot)?.stops_in_bbox([a, b], [c, d], limit)?)?;
+            print(&Snapshot::open(&snapshot)?.stops_in_bbox(
+                [a, b],
+                [c, d],
+                limit,
+                served_only,
+            )?)?;
         }
+        Cmd::Inventory {
+            config,
+            feeds,
+            out,
+            jobs,
+        } => rustis::inventory::run(&config, &feeds, &out, jobs)?,
         Cmd::Stats { snapshot } => print(&Snapshot::open(&snapshot)?.stats())?,
         Cmd::Verify { snapshot } => {
             Snapshot::open(&snapshot)?.verify()?;
@@ -234,7 +304,11 @@ fn main() -> Result<()> {
                 .build()?;
             rt.block_on(async move {
                 let listener = tokio::net::TcpListener::bind(listen).await?;
-                eprintln!("rustis serving {} on http://{listen}", s.service_date());
+                eprintln!(
+                    "rustis serving {} (+{} days) on http://{listen}",
+                    s.first_day(),
+                    s.meta().horizon_days
+                );
                 axum::serve(listener, rustis::http::router(s, max_concurrency))
                     .with_graceful_shutdown(async {
                         let _ = tokio::signal::ctrl_c().await;

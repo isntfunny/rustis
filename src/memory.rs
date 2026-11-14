@@ -41,3 +41,8 @@ impl ProcessMemory {
         })
     }
 }
+
+/// Current resident set size in MiB (for progress logs).
+pub fn rss_mib() -> Option<u64> {
+    ProcessMemory::current().map(|m| m.rss_kib / 1024)
+}
