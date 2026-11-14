@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use rustis::{BuildOptions, Endpoint, FeedSpec, PlanRequest, Snapshot, build_snapshot};
+use rustis::{BuildOptions, Endpoint, FeedSpec, PlanRequest, Snapshot, build_snapshot_jobs};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -12,6 +12,49 @@ use std::sync::Arc;
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
+}
+
+#[derive(clap::Args)]
+struct BuildArgs {
+    /// First service day YYYY-MM-DD (default: today).
+    #[arg(long)]
+    first_day: Option<String>,
+    #[arg(long, default_value_t = 366)]
+    horizon_days: u32,
+    /// Generate footpaths between stops closer than this (0 = off).
+    #[arg(long, default_value_t = 0.0)]
+    link_radius_m: f64,
+    #[arg(long, default_value_t = 1.2)]
+    walk_speed: f64,
+    #[arg(long, default_value_t = 720)]
+    max_footpath_secs: u32,
+    /// Minimum change time (s) at stops without a same-stop transfers.txt rule.
+    #[arg(long, default_value_t = 0)]
+    default_change_seconds: u32,
+    /// Treat pickup/drop_off 2/3 (booking) as not available.
+    #[arg(long)]
+    exclude_booking_stops: bool,
+    /// Comparison mode: footpaths/change times built like MOTIS (nigiri).
+    #[arg(long)]
+    motis_footpaths: bool,
+}
+
+impl BuildArgs {
+    fn options(&self) -> Result<BuildOptions> {
+        let first_day = match &self.first_day {
+            Some(d) => jiff::civil::Date::strptime("%Y-%m-%d", d)?,
+            None => jiff::Zoned::now().date(),
+        };
+        let mut opts = BuildOptions::new(first_day);
+        opts.horizon_days = self.horizon_days;
+        opts.link_radius_m = self.link_radius_m;
+        opts.walk_speed_m_per_s = self.walk_speed;
+        opts.max_footpath_secs = self.max_footpath_secs;
+        opts.default_change_seconds = self.default_change_seconds;
+        opts.exclude_booking_stops = self.exclude_booking_stops;
+        opts.motis_footpaths = self.motis_footpaths;
+        Ok(opts)
+    }
 }
 
 #[derive(Subcommand)]
@@ -33,27 +76,49 @@ enum Cmd {
         only: Vec<String>,
         #[arg(long)]
         out: PathBuf,
-        /// First service day YYYY-MM-DD (default: today).
+        /// Feeds parsed in parallel (committed in order; more jobs = more RAM).
+        #[arg(long, default_value_t = 1)]
+        jobs: usize,
+        #[command(flatten)]
+        build: BuildArgs,
+    },
+    /// Fetch the feeds of a MOTIS config from a mirror and publish a new
+    /// snapshot under ROOT/current (served ones reload it without restart).
+    Update {
+        /// Data root: feeds/, snapshots/, current -> snapshots/<id>.
         #[arg(long)]
-        first_day: Option<String>,
-        #[arg(long, default_value_t = 366)]
-        horizon_days: u32,
-        /// Generate footpaths between served stops closer than this (0 = off).
-        #[arg(long, default_value_t = 0.0)]
-        link_radius_m: f64,
-        #[arg(long, default_value_t = 1.2)]
-        walk_speed: f64,
-        #[arg(long, default_value_t = 720)]
-        max_footpath_secs: u32,
-        /// Minimum change time (s) at stops without a same-stop transfers.txt rule.
-        #[arg(long, default_value_t = 0)]
-        default_change_seconds: u32,
-        /// Treat pickup/drop_off 2/3 (booking) as not available.
+        root: PathBuf,
+        /// MOTIS config.yml listing the datasets (file names are taken from `path`).
         #[arg(long)]
-        exclude_booking_stops: bool,
-        /// Comparison mode: footpaths/change times built like MOTIS (nigiri).
+        motis_config: PathBuf,
+        /// Mirror base URL (file name appended).
+        #[arg(long, default_value = "https://api.transitous.org/gtfs")]
+        mirror: String,
+        /// Do not download; build from the files present in ROOT/feeds.
         #[arg(long)]
-        motis_footpaths: bool,
+        offline: bool,
+        #[arg(long, default_value = concat!("rustis/", env!("CARGO_PKG_VERSION")))]
+        user_agent: String,
+        #[arg(long, default_value_t = 4)]
+        download_jobs: usize,
+        /// Feeds parsed in parallel while downloading.
+        #[arg(long, default_value_t = 2)]
+        jobs: usize,
+        /// Total download rate in MB/s over all connections (Transitous asks for 30).
+        #[arg(long, default_value_t = 30.0)]
+        rate_limit_mb: f64,
+        /// Snapshots kept including the published one.
+        #[arg(long, default_value_t = 2)]
+        keep: usize,
+        /// Build even if nothing changed today.
+        #[arg(long)]
+        force: bool,
+        /// Exit with code 3 (after publishing) if more feeds than this could not
+        /// be downloaded or imported.
+        #[arg(long, default_value_t = 100)]
+        max_failed: usize,
+        #[command(flatten)]
+        build: BuildArgs,
     },
     /// Plan a journey against a snapshot.
     Plan {
@@ -121,6 +186,11 @@ enum Cmd {
         /// Per-search label budget (bounds per-query memory/time).
         #[arg(long, default_value_t = rustis::DEFAULT_MAX_LABELS)]
         max_labels: usize,
+        /// Check every N seconds whether --snapshot (e.g. ROOT/current, a
+        /// symlink switched by `rustis update`) points to a new snapshot and
+        /// switch to it without restart; SIGHUP checks immediately. 0 = off.
+        #[arg(long, default_value_t = 60)]
+        reload_interval: u64,
     },
 }
 
@@ -163,14 +233,8 @@ fn main() -> Result<()> {
             feed_dir,
             only,
             out,
-            first_day,
-            horizon_days,
-            link_radius_m,
-            walk_speed,
-            max_footpath_secs,
-            default_change_seconds,
-            exclude_booking_stops,
-            motis_footpaths,
+            jobs,
+            build,
         } => {
             let mut feeds: Vec<FeedSpec> = Vec::new();
             if let Some(cfg) = motis_config {
@@ -204,19 +268,7 @@ fn main() -> Result<()> {
             if feeds.is_empty() {
                 bail!("no feeds given (--gtfs or --motis-config)");
             }
-            let first_day = match first_day {
-                Some(d) => jiff::civil::Date::strptime("%Y-%m-%d", &d)?,
-                None => jiff::Zoned::now().date(),
-            };
-            let mut opts = BuildOptions::new(first_day);
-            opts.horizon_days = horizon_days;
-            opts.link_radius_m = link_radius_m;
-            opts.walk_speed_m_per_s = walk_speed;
-            opts.max_footpath_secs = max_footpath_secs;
-            opts.default_change_seconds = default_change_seconds;
-            opts.exclude_booking_stops = exclude_booking_stops;
-            opts.motis_footpaths = motis_footpaths;
-            let m = build_snapshot(&feeds, &out, opts)?;
+            let m = build_snapshot_jobs(&feeds, &out, build.options()?, jobs, &|_| Ok(()))?;
             let failed: Vec<_> = m.feeds.iter().filter(|f| !f.imported).collect();
             println!(
                 "built {}: {} feeds ({} failed), {} stops, {} routes, {} trips, {} bitfields, {} footpaths, {} specific rules in {:.0}s",
@@ -239,6 +291,102 @@ fn main() -> Result<()> {
             }
             if let Some(mem) = rustis::memory::ProcessMemory::current() {
                 println!("build peak RSS (VmHWM): {} MiB", mem.hwm_kib / 1024);
+            }
+        }
+        Cmd::Update {
+            root,
+            motis_config,
+            mirror,
+            offline,
+            user_agent,
+            download_jobs,
+            jobs,
+            rate_limit_mb,
+            keep,
+            force,
+            max_failed,
+            build,
+        } => {
+            let feeds = rustis::inventory::motis_datasets(&std::fs::read_to_string(&motis_config)?)
+                .into_iter()
+                .map(|(name, path)| {
+                    let file = std::path::Path::new(&path)
+                        .file_name()
+                        .context("dataset path")?
+                        .to_string_lossy()
+                        .into_owned();
+                    Ok((name, file))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            if feeds.is_empty() {
+                bail!("no datasets in {}", motis_config.display());
+            }
+            let cfg = rustis::update::UpdateConfig {
+                root,
+                feeds,
+                mirror: (!offline).then_some(mirror),
+                user_agent,
+                download_jobs,
+                parse_jobs: jobs,
+                rate_limit: (rate_limit_mb * 1e6) as u64,
+                opts: build.options()?,
+                keep,
+                force,
+            };
+            let r = rustis::update::run(&cfg)?;
+            let failed_dl = r.feeds.iter().filter(|f| {
+                matches!(
+                    f.status,
+                    rustis::update::DownloadStatus::Stale | rustis::update::DownloadStatus::Failed
+                )
+            });
+            let failed_dl: Vec<_> = failed_dl.collect();
+            println!(
+                "update: {:?}, {:.1} MB downloaded, downloads {:.0}s, total {:.0}s",
+                r.counts,
+                r.downloaded_bytes as f64 / 1e6,
+                r.download_seconds,
+                r.total_seconds
+            );
+            for f in &failed_dl {
+                println!(
+                    "  download {:?}: {} ({})",
+                    f.status,
+                    f.name,
+                    f.error.as_deref().unwrap_or("")
+                );
+            }
+            let mut failed_import = 0;
+            match (&r.snapshot, &r.skipped) {
+                (Some(s), _) => {
+                    let m: rustis::SnapshotMeta = serde_json::from_slice(&std::fs::read(
+                        cfg.root.join("snapshots").join(s).join("snapshot.json"),
+                    )?)?;
+                    for f in m.feeds.iter().filter(|f| !f.imported) {
+                        failed_import += 1;
+                        println!(
+                            "  import failed: {} ({})",
+                            f.name,
+                            f.error.as_deref().unwrap_or("")
+                        );
+                    }
+                    for w in &m.warnings {
+                        println!("  warning: {w}");
+                    }
+                    println!(
+                        "published snapshots/{s}: {} stops, {} trips, build {:.0}s; removed {:?}",
+                        m.n_stops, m.n_trips, m.build_seconds, r.removed_snapshots
+                    );
+                }
+                (None, Some(why)) => println!("{why}"),
+                (None, None) => {}
+            }
+            if let Some(mem) = rustis::memory::ProcessMemory::current() {
+                println!("update peak RSS (VmHWM): {} MiB", mem.hwm_kib / 1024);
+            }
+            if failed_dl.len() + failed_import > max_failed {
+                eprintln!("more than {max_failed} feeds failed");
+                std::process::exit(3);
             }
         }
         Cmd::Plan {
@@ -304,23 +452,52 @@ fn main() -> Result<()> {
             listen,
             max_concurrency,
             max_labels,
+            reload_interval,
         } => {
-            let mut s = Snapshot::open(&snapshot)?;
-            s.set_max_labels(max_labels);
-            let s = Arc::new(s);
+            let handle = Arc::new(rustis::http::SnapshotHandle::new(
+                Snapshot::open(&snapshot)?,
+                Some(snapshot.clone()),
+                max_labels,
+            ));
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(2)
-                .max_blocking_threads(max_concurrency.max(1))
+                .max_blocking_threads(max_concurrency.max(1) + 1)
                 .enable_all()
                 .build()?;
             rt.block_on(async move {
                 let listener = tokio::net::TcpListener::bind(listen).await?;
+                let s = handle.get();
                 eprintln!(
-                    "rustis serving {} (+{} days) on http://{listen}",
+                    "rustis serving {} ({} +{} days) on http://{listen}",
+                    s.dir().display(),
                     s.first_day(),
                     s.meta().horizon_days
                 );
-                axum::serve(listener, rustis::http::router(s, max_concurrency))
+                drop(s);
+                if reload_interval > 0 {
+                    let h = handle.clone();
+                    tokio::spawn(async move {
+                        use tokio::signal::unix::{SignalKind, signal};
+                        let mut hup = signal(SignalKind::hangup()).ok();
+                        let mut tick =
+                            tokio::time::interval(std::time::Duration::from_secs(reload_interval));
+                        loop {
+                            match &mut hup {
+                                Some(hup) => tokio::select! {
+                                    _ = tick.tick() => {}
+                                    _ = hup.recv() => {}
+                                },
+                                None => {
+                                    tick.tick().await;
+                                }
+                            }
+                            let h = h.clone();
+                            let _ =
+                                tokio::task::spawn_blocking(move || h.reload_if_changed()).await;
+                        }
+                    });
+                }
+                axum::serve(listener, rustis::http::router_with(handle, max_concurrency))
                     .with_graceful_shutdown(async {
                         let _ = tokio::signal::ctrl_c().await;
                     })

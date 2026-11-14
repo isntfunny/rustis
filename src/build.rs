@@ -167,6 +167,32 @@ struct FeedData {
     footpaths: Vec<(u32, u32, u32)>,
     forbidden: Vec<(u32, u32)>,
     rules: Vec<Rule>,
+    /// Feed-local tables referenced by `stop_tz`/`Pattern::tz` and `Trip::bits`.
+    tz_names: Vec<String>,
+    bitfield_table: Vec<u64>,
+    max_time: u32,
+}
+
+/// A parsed, validated feed (feed-local indices) ready to be committed.
+pub struct ParsedFeed(FeedData);
+
+impl ParsedFeed {
+    pub fn report(&self) -> &FeedReport {
+        &self.0.report
+    }
+}
+
+/// Parses and validates one feed without touching a builder (thread-safe).
+pub fn parse_feed(spec: &FeedSpec, opts: &BuildOptions) -> Result<ParsedFeed> {
+    let mut p = Parser {
+        opts,
+        words: (opts.horizon_days as usize + 1).div_ceil(64),
+        tz_names: Vec::new(),
+        bitfields: HashMap::new(),
+        bitfield_table: Vec::new(),
+        max_time: 0,
+    };
+    p.read_feed(spec).map(ParsedFeed)
 }
 
 pub struct Builder {
@@ -334,8 +360,20 @@ impl Builder {
     /// Imports one feed; failures are recorded in the report, not propagated.
     pub fn add_feed(&mut self, spec: &FeedSpec) -> FeedReport {
         let t0 = std::time::Instant::now();
-        let mut report = match self.read_feed(spec) {
-            Ok(data) => self.commit(data),
+        let parsed = parse_feed(spec, &self.opts);
+        self.add_parsed(spec, parsed, t0)
+    }
+
+    /// Commits a feed parsed with [`parse_feed`] (possibly on another thread);
+    /// `t0` is when its processing started (for the log line).
+    pub fn add_parsed(
+        &mut self,
+        spec: &FeedSpec,
+        parsed: Result<ParsedFeed>,
+        t0: std::time::Instant,
+    ) -> FeedReport {
+        let mut report = match parsed {
+            Ok(ParsedFeed(data)) => self.commit(data),
             Err(e) => FeedReport {
                 name: spec.name.clone(),
                 file: spec.path.display().to_string(),
@@ -356,6 +394,39 @@ impl Builder {
         );
         self.feeds.push(report.clone());
         report
+    }
+}
+
+/// Feed parser: produces feed-local indices (stops, route infos, GTFS trips,
+/// time zones, bitfields), remapped when the feed is committed. Independent
+/// of the builder, so several feeds can be parsed in parallel.
+struct Parser<'a> {
+    opts: &'a BuildOptions,
+    words: usize,
+    tz_names: Vec<String>,
+    bitfields: HashMap<Box<[u64]>, u32>,
+    bitfield_table: Vec<u64>,
+    max_time: u32,
+}
+
+impl Parser<'_> {
+    fn tz_index(&mut self, name: &str) -> Result<u16> {
+        if let Some(i) = self.tz_names.iter().position(|t| t == name) {
+            return Ok(i as u16);
+        }
+        jiff::tz::TimeZone::get(name).with_context(|| format!("unknown time zone {name:?}"))?;
+        self.tz_names.push(name.to_owned());
+        Ok((self.tz_names.len() - 1) as u16)
+    }
+
+    fn bitfield(&mut self, bits: &[u64]) -> u32 {
+        if let Some(&i) = self.bitfields.get(bits) {
+            return i;
+        }
+        let i = (self.bitfield_table.len() / self.words) as u32;
+        self.bitfield_table.extend_from_slice(bits);
+        self.bitfields.insert(bits.into(), i);
+        i
     }
 
     fn read_feed(&mut self, spec: &FeedSpec) -> Result<FeedData> {
@@ -403,7 +474,7 @@ impl Builder {
         report.timezone = tz_name;
 
         // stops.txt
-        let stop_base = self.stops.len() as u32;
+        let stop_base = 0u32;
         let mut stops = Vec::new();
         let mut stop_tz = Vec::new();
         let mut stop_idx: HashMap<Box<[u8]>, u32> = HashMap::new();
@@ -464,7 +535,7 @@ impl Builder {
         report.stops = stops.len() as u64;
 
         // routes.txt
-        let info_base = self.route_info_type.len() as u32;
+        let info_base = 0u32;
         let mut route_infos = Vec::new();
         let mut route_idx: HashMap<Box<[u8]>, u32> = HashMap::new();
         feed.rows("routes.txt", |c, r| {
@@ -566,7 +637,7 @@ impl Builder {
             gtfs: u32,
             block: Option<Box<[u8]>>,
         }
-        let gtfs_base = self.n_gtfs_trips;
+        let gtfs_base = 0u32;
         let mut gtfs_trip_ids = Vec::new();
         let mut trips: HashMap<Box<[u8]>, TripMeta> = HashMap::new();
         feed.rows("trips.txt", |c, r| {
@@ -653,7 +724,7 @@ impl Builder {
                           rows: &mut Vec<Row>,
                           bad: bool,
                           skip: &mut BTreeMap<String, u64>,
-                          builder: &mut Builder|
+                          builder: &mut Parser<'_>|
          -> Result<()> {
             let take = std::mem::take(rows);
             let Some(meta) = trips.get(trip_id) else {
@@ -1026,9 +1097,14 @@ impl Builder {
             footpaths,
             forbidden,
             rules,
+            tz_names: std::mem::take(&mut self.tz_names),
+            bitfield_table: std::mem::take(&mut self.bitfield_table),
+            max_time: self.max_time,
         })
     }
+}
 
+impl Builder {
     fn commit(&mut self, d: FeedData) -> FeedReport {
         match self.commit_inner(d) {
             Ok(r) => r,
@@ -1037,17 +1113,34 @@ impl Builder {
     }
 
     fn commit_inner(&mut self, d: FeedData) -> Result<FeedReport> {
+        // feed-local → global indices
         let base = self.stops.len() as u32;
+        let info_base = self.route_info_type.len() as u32;
+        let gtfs_base = self.n_gtfs_trips;
+        let tz_map = d
+            .tz_names
+            .iter()
+            .map(|t| self.tz_index(t))
+            .collect::<Result<Vec<u16>>>()?;
+        let words = self.words;
+        let bits_map: Vec<u32> = d
+            .bitfield_table
+            .chunks_exact(words)
+            .map(|b| self.bitfield(b))
+            .collect();
+        self.max_time = self.max_time.max(d.max_time);
         let feed_no = self.feeds.len() as u32;
         self.stop_feed
             .extend(std::iter::repeat_n(feed_no, d.stops.len()));
         self.stops.extend(d.stops);
-        self.stop_tz.extend(d.stop_tz);
+        self.stop_tz
+            .extend(d.stop_tz.iter().map(|&t| tz_map[t as usize]));
         self.change
             .resize(self.stops.len(), self.opts.default_change_seconds);
         let mut explicit: HashMap<u32, u32> = HashMap::new();
         let motis = self.opts.motis_footpaths;
         for (s, secs) in d.change {
+            let s = s + base;
             // several rows for one stop: the strictest one wins (MOTIS mode:
             // the shortest, in whole minutes, as nigiri does)
             if motis {
@@ -1066,7 +1159,6 @@ impl Builder {
         for (s, secs) in explicit {
             self.change[s as usize] = secs;
         }
-        debug_assert!(base <= self.stops.len() as u32);
         for (id, line, rt) in d.route_infos {
             self.route_info_id.push(&id)?;
             self.route_info_line.push(&line)?;
@@ -1078,14 +1170,40 @@ impl Builder {
         self.n_gtfs_trips += d.gtfs_trip_ids.len() as u32;
         let mut routes = 0u64;
         for p in d.patterns {
-            for route in split_fifo(p.trips) {
-                self.write_route(&p.stops, &p.flags, p.tz, p.info, route)?;
+            let stops: Vec<u32> = p.stops.iter().map(|&s| s + base).collect();
+            let mut trips = p.trips;
+            for t in &mut trips {
+                t.bits = bits_map[t.bits as usize];
+                t.gtfs += gtfs_base;
+            }
+            for route in split_fifo(trips) {
+                self.write_route(
+                    &stops,
+                    &p.flags,
+                    tz_map[p.tz as usize],
+                    p.info + info_base,
+                    route,
+                )?;
                 routes += 1;
             }
         }
-        self.footpaths.extend(d.footpaths);
-        self.forbidden.extend(d.forbidden);
-        self.rules.extend(d.rules);
+        self.footpaths.extend(
+            d.footpaths
+                .into_iter()
+                .map(|(a, b, t)| (a + base, b + base, t)),
+        );
+        self.forbidden
+            .extend(d.forbidden.into_iter().map(|(a, b)| (a + base, b + base)));
+        let opt = |x: u32, off: u32| if x == NONE { NONE } else { x + off };
+        self.rules.extend(d.rules.into_iter().map(|r| Rule {
+            to_stop: r.to_stop + base,
+            from_stop: r.from_stop + base,
+            from_trip: opt(r.from_trip, gtfs_base),
+            from_route: opt(r.from_route, info_base),
+            to_trip: opt(r.to_trip, gtfs_base),
+            to_route: opt(r.to_route, info_base),
+            secs: r.secs,
+        }));
         let mut r = d.report;
         r.routes = routes;
         Ok(r)

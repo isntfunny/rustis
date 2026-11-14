@@ -9,24 +9,117 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::json;
-use std::sync::Arc;
+use std::path::PathBuf;
+use std::sync::{Arc, RwLock};
 use tokio::sync::Semaphore;
+
+/// The served snapshot; can be switched while serving. Requests keep the
+/// `Arc` they started with, so an old snapshot is unmapped once its last
+/// request finished.
+pub struct SnapshotHandle {
+    current: RwLock<Arc<Snapshot>>,
+    /// Path watched for a new snapshot (e.g. `ROOT/current`, a symlink).
+    watch: Option<PathBuf>,
+    max_labels: usize,
+    status: RwLock<ReloadStatus>,
+}
+
+#[derive(Clone, Default, serde::Serialize)]
+struct ReloadStatus {
+    /// Resolved directory of the served snapshot.
+    snapshot: PathBuf,
+    loaded_at: String,
+    reloads: u64,
+    last_error: Option<String>,
+}
+
+impl SnapshotHandle {
+    pub fn new(snapshot: Snapshot, watch: Option<PathBuf>, max_labels: usize) -> Self {
+        let mut snapshot = snapshot;
+        snapshot.set_max_labels(max_labels);
+        let snapshot_dir = snapshot.dir().to_owned();
+        Self {
+            current: RwLock::new(Arc::new(snapshot)),
+            watch,
+            max_labels,
+            status: RwLock::new(ReloadStatus {
+                snapshot: std::fs::canonicalize(snapshot_dir.as_path())
+                    .unwrap_or(snapshot_dir.clone()),
+                loaded_at: jiff::Timestamp::now().to_string(),
+                ..Default::default()
+            }),
+        }
+    }
+
+    pub fn get(&self) -> Arc<Snapshot> {
+        self.current.read().unwrap().clone()
+    }
+
+    /// Opens the snapshot the watched path resolves to if it differs from
+    /// the served one. On failure the served snapshot stays (error recorded).
+    pub fn reload_if_changed(&self) -> anyhow::Result<bool> {
+        let Some(w) = &self.watch else {
+            return Ok(false);
+        };
+        let r = (|| {
+            let target = std::fs::canonicalize(w)?;
+            if target == self.status.read().unwrap().snapshot {
+                return Ok(false);
+            }
+            let mut s = Snapshot::open(&target)?;
+            s.set_max_labels(self.max_labels);
+            *self.current.write().unwrap() = Arc::new(s);
+            eprintln!("reloaded snapshot {}", target.display());
+            self.status.write().unwrap().snapshot = target;
+            Ok(true)
+        })();
+        let mut st = self.status.write().unwrap();
+        match &r {
+            Ok(true) => {
+                st.loaded_at = jiff::Timestamp::now().to_string();
+                st.reloads += 1;
+                st.last_error = None;
+            }
+            Ok(false) => {}
+            Err(e) => {
+                let msg = format!("{e:#}");
+                if st.last_error.as_deref() != Some(msg.as_str()) {
+                    eprintln!("snapshot reload failed, keeping the served one: {msg}");
+                }
+                st.last_error = Some(msg);
+            }
+        }
+        r
+    }
+}
 
 #[derive(Clone)]
 struct AppState {
-    snapshot: Arc<Snapshot>,
+    handle: Arc<SnapshotHandle>,
     permits: Arc<Semaphore>,
 }
 
 /// Builds the router. `max_concurrency` bounds simultaneous plan/bbox queries;
 /// excess requests get `503` instead of queueing unboundedly.
 pub fn router(snapshot: Arc<Snapshot>, max_concurrency: usize) -> Router {
+    let snapshot =
+        Arc::try_unwrap(snapshot).unwrap_or_else(|_| panic!("router needs the only reference"));
+    let labels = snapshot.max_labels();
+    router_with(
+        Arc::new(SnapshotHandle::new(snapshot, None, labels)),
+        max_concurrency,
+    )
+}
+
+/// Router over a reloadable snapshot.
+pub fn router_with(handle: Arc<SnapshotHandle>, max_concurrency: usize) -> Router {
     let state = AppState {
-        snapshot,
+        handle,
         permits: Arc::new(Semaphore::new(max_concurrency.max(1))),
     };
     Router::new()
         .route("/health", get(health))
+        .route("/v1/feeds", get(feeds))
         .route("/v1/stats", get(stats))
         .route("/v1/stops", get(stops))
         .route("/v1/plan", post(plan))
@@ -48,11 +141,26 @@ impl IntoResponse for Error {
 }
 
 async fn health(State(s): State<AppState>) -> Response {
-    Json(json!({ "status": "ok", "first_day": s.snapshot.first_day(), "horizon_days": s.snapshot.meta().horizon_days, "warnings": s.snapshot.warnings() })).into_response()
+    let snap = s.handle.get();
+    let reload = s.handle.status.read().unwrap().clone();
+    Json(json!({
+        "status": "ok",
+        "snapshot": reload.snapshot.file_name().map(|f| f.to_string_lossy().into_owned()),
+                "first_day": snap.first_day(),
+        "horizon_days": snap.meta().horizon_days,
+        "reload": reload,
+        "warnings": snap.warnings(),
+        "feed_warnings": snap.feed_warnings(7),
+    }))
+    .into_response()
+}
+
+async fn feeds(State(s): State<AppState>) -> Response {
+    Json(json!({ "feeds": s.handle.get().feeds() })).into_response()
 }
 
 async fn stats(State(s): State<AppState>) -> Response {
-    Json(s.snapshot.stats()).into_response()
+    Json(s.handle.get().stats()).into_response()
 }
 
 #[derive(Deserialize)]
@@ -82,7 +190,7 @@ async fn run_blocking<T: Send + 'static>(
             "too many concurrent queries",
         ));
     };
-    let snap = s.snapshot.clone();
+    let snap = s.handle.get();
     let out = tokio::task::spawn_blocking(move || {
         let _permit = permit;
         f(&snap)

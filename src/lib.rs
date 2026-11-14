@@ -11,9 +11,13 @@ mod model;
 mod raptor;
 pub mod store;
 mod tt;
+pub mod update;
 
 pub use build::{BuildOptions, FeedReport, FeedSpec, SnapshotMeta};
-pub use engine::{DEFAULT_MAX_LABELS, Snapshot, build_snapshot, import_gtfs, import_gtfs_with};
+pub use engine::{
+    DEFAULT_MAX_LABELS, Snapshot, build_snapshot, build_snapshot_jobs, import_gtfs,
+    import_gtfs_with,
+};
 pub use model::*;
 
 /// Errors from serving APIs: client mistakes vs. internal failures.

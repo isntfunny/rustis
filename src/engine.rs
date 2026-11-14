@@ -28,6 +28,22 @@ pub const DEFAULT_MAX_LABELS: usize = 150_000;
 
 /// Builds a snapshot from several feeds into `dest` (staging dir + rename).
 pub fn build_snapshot(feeds: &[FeedSpec], dest: &Path, opts: BuildOptions) -> Result<SnapshotMeta> {
+    build_snapshot_jobs(feeds, dest, opts, 1, &|_| Ok(()))
+}
+
+/// Like [`build_snapshot`], parsing up to `jobs` feeds in parallel. Feeds are
+/// committed in input order (the snapshot is identical to a serial build).
+/// `ready(i)` blocks until feed `i` can be read (e.g. its download finished);
+/// an `Err` marks the feed as failed with that message.
+pub fn build_snapshot_jobs(
+    feeds: &[FeedSpec],
+    dest: &Path,
+    opts: BuildOptions,
+    jobs: usize,
+    ready: &(dyn Fn(usize) -> Result<(), String> + Sync),
+) -> Result<SnapshotMeta> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Condvar, Mutex, mpsc};
     let t0 = std::time::Instant::now();
     anyhow::ensure!(!dest.exists(), "{} already exists", dest.display());
     let staging = dest.with_extension("staging");
@@ -35,10 +51,55 @@ pub fn build_snapshot(feeds: &[FeedSpec], dest: &Path, opts: BuildOptions) -> Re
         std::fs::remove_dir_all(&staging)?;
     }
     std::fs::create_dir_all(&staging)?;
-    let mut b = build::Builder::new(&staging, opts)?;
-    for f in feeds {
-        b.add_feed(f);
-    }
+    let mut b = build::Builder::new(&staging, opts.clone())?;
+    let jobs = jobs.max(1);
+    // Parsed feeds wait in order for their commit; at most `window` feeds are
+    // in flight or waiting (bounds memory when a large feed is slow).
+    let window = 2 * jobs;
+    let next = AtomicUsize::new(0);
+    let gate = (Mutex::new(0usize), Condvar::new());
+    std::thread::scope(|sc| {
+        let (tx, rx) = mpsc::channel();
+        for _ in 0..jobs {
+            let tx = tx.clone();
+            let (next, gate, opts) = (&next, &gate, &opts);
+            sc.spawn(move || {
+                loop {
+                    let i = next.fetch_add(1, Ordering::SeqCst);
+                    if i >= feeds.len() {
+                        break;
+                    }
+                    {
+                        let mut done = gate.0.lock().unwrap();
+                        while i >= *done + window {
+                            done = gate.1.wait(done).unwrap();
+                        }
+                    }
+                    let r = ready(i);
+                    let t = std::time::Instant::now();
+                    let parsed = match r {
+                        Ok(()) => build::parse_feed(&feeds[i], opts),
+                        Err(e) => Err(anyhow::anyhow!(e)),
+                    };
+                    if tx.send((i, parsed, t)).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+        drop(tx);
+        let mut pending = std::collections::BTreeMap::new();
+        let mut k = 0usize;
+        for (i, parsed, t) in rx {
+            pending.insert(i, (parsed, t));
+            while let Some((parsed, t)) = pending.remove(&k) {
+                b.add_parsed(&feeds[k], parsed, t);
+                k += 1;
+                *gate.0.lock().unwrap() = k;
+                gate.1.notify_all();
+            }
+        }
+    });
     let meta = b.finish(t0)?;
     let json = serde_json::to_vec_pretty(&meta)?;
     std::fs::write(staging.join("snapshot.json"), json)?;
@@ -67,6 +128,10 @@ impl Snapshot {
 
     pub fn verify(&self) -> Result<()> {
         self.tt.verify()
+    }
+
+    pub fn max_labels(&self) -> usize {
+        self.max_labels
     }
 
     pub fn set_max_labels(&mut self, n: usize) {
@@ -660,6 +725,96 @@ impl Snapshot {
     }
 
     /// Warnings attached to every response (known coverage/semantic limits).
+    /// Snapshot directory.
+    pub fn dir(&self) -> &Path {
+        &self.tt.dir
+    }
+
+    /// Per-feed diagnostics: import report, published validity and (for
+    /// snapshots built by `rustis update`) the download status.
+    pub fn feeds(&self) -> Vec<serde_json::Value> {
+        let update: Option<crate::update::UpdateReport> =
+            std::fs::read(self.tt.dir.join("update.json"))
+                .ok()
+                .and_then(|b| serde_json::from_slice(&b).ok());
+        let dl: std::collections::HashMap<&str, &crate::update::FeedStatus> = update
+            .as_ref()
+            .map(|u| u.feeds.iter().map(|f| (f.name.as_str(), f)).collect())
+            .unwrap_or_default();
+        self.tt
+            .meta
+            .feeds
+            .iter()
+            .map(|f| {
+                let d = dl.get(f.name.as_str());
+                serde_json::json!({
+                    "name": f.name,
+                    "file": f.file,
+                    "imported": f.imported,
+                    "error": f.error,
+                    "trips": f.trips,
+                    "service_range": f.service_range,
+                    "download": d.map(|d| &d.status),
+                    "download_error": d.and_then(|d| d.error.as_ref()),
+                    "last_modified": d.and_then(|d| d.last_modified.as_ref()),
+                })
+            })
+            .collect()
+    }
+
+    /// Feed-level problems for `/health`: failed/stale downloads, failed
+    /// imports, published validity ending within `days` days from today.
+    pub fn feed_warnings(&self, days: i64) -> Vec<String> {
+        let mut out = Vec::new();
+        let feeds = self.feeds();
+        let names = |pred: &dyn Fn(&serde_json::Value) -> bool| -> Vec<String> {
+            feeds
+                .iter()
+                .filter(|f| pred(f))
+                .map(|f| f["name"].as_str().unwrap_or("").to_owned())
+                .collect()
+        };
+        let list = |v: &[String]| {
+            let mut s = v.iter().take(10).cloned().collect::<Vec<_>>().join(", ");
+            if v.len() > 10 {
+                s += &format!(", … (+{})", v.len() - 10);
+            }
+            s
+        };
+        let stale = names(&|f| f["download"] == "stale");
+        if !stale.is_empty() {
+            out.push(format!(
+                "{} feed(s) could not be refreshed, previous file used: {}",
+                stale.len(),
+                list(&stale)
+            ));
+        }
+        let failed = names(&|f| f["imported"] == false);
+        if !failed.is_empty() {
+            out.push(format!(
+                "{} feed(s) not imported: {}",
+                failed.len(),
+                list(&failed)
+            ));
+        }
+        let limit = (jiff::Zoned::now().date() + jiff::Span::new().days(days)).to_string();
+        let ending = names(&|f| {
+            f["imported"] == true
+                && f["trips"].as_u64().unwrap_or(0) > 0
+                && f["service_range"][1]
+                    .as_str()
+                    .is_some_and(|e| e < limit.as_str())
+        });
+        if !ending.is_empty() {
+            out.push(format!(
+                "{} feed(s) publish service only until before {limit}: {}",
+                ending.len(),
+                list(&ending)
+            ));
+        }
+        out
+    }
+
     pub fn warnings(&self) -> Vec<String> {
         self.tt
             .meta
