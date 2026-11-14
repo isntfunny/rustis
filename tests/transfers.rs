@@ -292,7 +292,6 @@ fn relaxing_rules_are_not_exploited_and_flagged() {
     let h = "from_stop_id,to_stop_id,transfer_type,min_transfer_time,from_trip_id,to_trip_id\n";
     for row in [
         "B,D,1,,T1,T2",
-        "B,B,4,,T1,T3",
         "B,B,5,,T1,T3",
         "B,D,0,,T1,T2",
         "B,D,1,,,",
@@ -373,4 +372,36 @@ fn reported_arrivals_exclude_the_internal_change_time() {
     assert_eq!(trips(&r)[0], ["T1", "T3"]);
     assert_eq!(r.itineraries[0].arrival, H8 + 20 * 60);
     assert_eq!(r.itineraries[0].arrival_time, "2026-11-16T08:20:00+01:00");
+}
+
+/// Feeder T3 (B 08:12 → C 08:20) continues T1 (A → B 08:10) when both
+/// share a block (stay seated): no change time, even though B requires 600 s.
+fn block_feed(t1_block: &str, t3_block: &str, t3_service: &str) -> (TempDir, Snapshot) {
+    let tmp = TempDir::new().unwrap();
+    let src = feed(tmp.path(), &format!("{HEADER}B,B,2,600\n"));
+    let trips = format!(
+        "route_id,service_id,trip_id,trip_headsign,block_id\nR1,daily,T1,Interchange,{t1_block}\nR2,daily,T2,Destination,\nRS,daily,SLOW,Destination,\nRN,daily,NIGHT,Destination,\nRP,daily,NOPICK,Destination,\nRP,daily,NODROP,Destination,\nR3,{t3_service},T3,Destination,{t3_block}\n"
+    );
+    std::fs::write(src.join("trips.txt"), trips).unwrap();
+    let cal = std::fs::read_to_string(fixture().join("calendar.txt")).unwrap()
+        + "other,1,1,1,1,1,1,1,20261101,20261231\n";
+    std::fs::write(src.join("calendar.txt"), cal).unwrap();
+    let dest = tmp.path().join("snapshot");
+    import_gtfs_with(&src, &dest, &opts()).unwrap();
+    (tmp, Snapshot::open(&dest).unwrap())
+}
+
+#[test]
+fn stay_seated_continuations_skip_the_change_time() {
+    let (_t, s) = block_feed("blk", "blk", "daily");
+    assert_eq!(trips(&plan(&s))[0], ["T1", "T3"]);
+    // Different block, or same block on another service: a normal change (600 s) applies.
+    let (_t, s) = block_feed("blk", "other", "daily");
+    assert_eq!(trips(&plan(&s)), [["SLOW"]]);
+    let (_t, s) = block_feed("blk", "blk", "other");
+    assert_eq!(trips(&plan(&s)), [["SLOW"]]);
+    // transfers.txt type 4 between the two trips has the same effect.
+    let h = "from_stop_id,to_stop_id,transfer_type,min_transfer_time,from_trip_id,to_trip_id\n";
+    let (_t, s) = import(&format!("{h}B,B,2,600,,\nB,B,4,,T1,T3\n"), &opts());
+    assert_eq!(trips(&plan(&s))[0], ["T1", "T3"]);
 }

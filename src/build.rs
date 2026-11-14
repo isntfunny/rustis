@@ -564,6 +564,7 @@ impl Builder {
             info: u32,
             service: Option<Box<[u8]>>,
             gtfs: u32,
+            block: Option<Box<[u8]>>,
         }
         let gtfs_base = self.n_gtfs_trips;
         let mut gtfs_trip_ids = Vec::new();
@@ -577,6 +578,8 @@ impl Builder {
             let sid = field(r, c.get("service_id"));
             let service = services.contains_key(sid).then(|| sid.into());
             let gtfs = gtfs_base + gtfs_trip_ids.len() as u32;
+            let block = field(r, c.get("block_id"));
+            let block = (!block.is_empty()).then(|| block.into());
             if trips
                 .insert(
                     id.into(),
@@ -584,6 +587,7 @@ impl Builder {
                         info,
                         service,
                         gtfs,
+                        block,
                     },
                 )
                 .is_some()
@@ -643,6 +647,8 @@ impl Builder {
         let mut n_rows = 0u64;
         let mut n_trips = 0u64;
         let mut tmp_bits = vec![0u64; words];
+        type BlockEnd = (Box<[u8]>, Box<[u8]>, u32, u32, u32, u32, u32);
+        let mut block_ends: Vec<BlockEnd> = Vec::new();
         let mut finish = |trip_id: &[u8],
                           rows: &mut Vec<Row>,
                           bad: bool,
@@ -727,6 +733,18 @@ impl Builder {
                 return Ok(());
             }
             let base_bits = &services[service];
+            if let (Some(block), false) = (&meta.block, freqs.contains_key(trip_id)) {
+                // (block, service, first stop, first departure, last stop, last arrival, gtfs trip)
+                block_ends.push((
+                    block.clone(),
+                    service.clone(),
+                    take[0].stop,
+                    t[0].1,
+                    take[n - 1].stop,
+                    t[n - 1].0,
+                    meta.gtfs,
+                ));
+            }
             let starts: Vec<u32> = match freqs.get(trip_id) {
                 None => vec![t[0].1],
                 Some(f) => {
@@ -848,6 +866,26 @@ impl Builder {
             finish(&prev, &mut rows, bad_trip, &mut skip, self)?;
         }
         report.stop_times = n_rows;
+        // Stay-seated continuations: consecutive trips of the same block and
+        // service that end/start at the same stop (≤ 1 h layover) may be
+        // continued without a change time (GTFS block_id semantics).
+        let mut stay_rules: Vec<Rule> = Vec::new();
+        block_ends.sort_unstable_by(|x, y| (&x.0, &x.1, x.3).cmp(&(&y.0, &y.1, y.3)));
+        for w in block_ends.windows(2) {
+            let (x, y) = (&w[0], &w[1]);
+            if x.0 == y.0 && x.1 == y.1 && x.4 == y.2 && y.3 >= x.5 && y.3 - x.5 <= 3600 {
+                stay_rules.push(Rule {
+                    to_stop: y.2,
+                    from_stop: x.4,
+                    from_trip: x.6,
+                    from_route: NONE,
+                    to_trip: y.6,
+                    to_route: NONE,
+                    secs: 0,
+                });
+            }
+        }
+        skip.insert("block_stay_seated_rules".into(), stay_rules.len() as u64);
         report.trips = n_trips;
         report.routes = patterns.len() as u64;
 
@@ -855,8 +893,9 @@ impl Builder {
         let mut change: Vec<(u32, u32)> = Vec::new();
         let mut footpaths = Vec::new();
         let mut forbidden = Vec::new();
-        let mut rules = Vec::new();
+        let mut rules = stay_rules;
         let mut tr = BTreeMap::<String, u64>::new();
+        let motis_mode = self.opts.motis_footpaths;
         let walk = self.opts.walk_speed_m_per_s;
         let gtfs_of = |id: &[u8]| trips.get(id).map(|m| m.gtfs);
         feed.rows("transfers.txt", |c, r| {
@@ -887,8 +926,24 @@ impl Builder {
             );
             let specific = !(ft.is_empty() && tt_.is_empty() && fr.is_empty() && rt.is_empty());
             let key = |k: &str| format!("{}type{ty}{k}", if specific { "specific_" } else { "" });
+            // MOTIS comparison mode: nigiri folds trip/route-specific min-time
+            // rows into the stop's (minimum) transfer time and ignores
+            // specific forbidden rows.
+            if motis_mode && specific && ty == 2 {
+                if a == b {
+                    change.push((a, mtt.unwrap_or(0)));
+                } else {
+                    footpaths.push((a, b, mtt.unwrap_or(0)));
+                }
+                *tr.entry(key("_motis_mode_folded")).or_default() += 1;
+                return Ok(());
+            }
+            if motis_mode && specific && ty == 3 {
+                *tr.entry(key("_motis_mode_ignored")).or_default() += 1;
+                return Ok(());
+            }
             match (ty, specific) {
-                (2 | 3, true) => {
+                (2 | 3 | 4, true) => {
                     let resolve = |v: &[u8], f: &dyn Fn(&[u8]) -> Option<u32>| -> Option<u32> {
                         if v.is_empty() { Some(NONE) } else { f(v) }
                     };
@@ -901,7 +956,12 @@ impl Builder {
                         *tr.entry(key("_unknown_trip_or_route")).or_default() += 1;
                         return Ok(());
                     };
-                    let secs = if ty == 3 { FORBIDDEN } else { mtt.unwrap_or(0) };
+                    // 4 = stay seated: continuing on the given trip needs no change time
+                    let secs = match ty {
+                        3 => FORBIDDEN,
+                        4 => 0,
+                        _ => mtt.unwrap_or(0),
+                    };
                     rules.push(Rule {
                         to_stop: b,
                         from_stop: a,
@@ -946,7 +1006,7 @@ impl Builder {
                     forbidden.push((a, b));
                     *tr.entry(key("_forbidden_pair")).or_default() += 1;
                 }
-                // 0 specific ("recommended"), 1 (timed), 4/5 (in-seat): not exploited.
+                // 0 specific ("recommended"), 1 (timed), 4 without trips, 5: not exploited.
                 // Ignoring them can only miss connections, never create invalid ones.
                 _ => *tr.entry(key("_not_exploited")).or_default() += 1,
             }
