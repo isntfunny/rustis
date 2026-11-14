@@ -943,7 +943,7 @@ impl Builder {
                 return Ok(());
             }
             match (ty, specific) {
-                (2 | 3 | 4, true) => {
+                (2..=4, true) => {
                     let resolve = |v: &[u8], f: &dyn Fn(&[u8]) -> Option<u32>| -> Option<u32> {
                         if v.is_empty() { Some(NONE) } else { f(v) }
                     };
@@ -1212,11 +1212,15 @@ impl Builder {
         // Footpaths: generated links (served stops within the radius), the
         // feeds' stop-level rules, then a transitive closure capped at
         // `max_footpath_secs`; forbidden pairs are removed.
+        // Unserved stops (stations, entrances, stops of other periods) are
+        // walkable intermediate points: they take part in linking and the
+        // closure, but only footpaths between served stops are written.
+        let walkable: Vec<bool> = self.stops.iter().map(|s| s.lat.is_some()).collect();
         let mut generated = Vec::new();
         if self.opts.link_radius_m > 0.0 {
             link_nearby(
                 &self.stops,
-                &served,
+                &walkable,
                 self.opts.link_radius_m,
                 self.opts.walk_speed_m_per_s,
                 &mut generated,
@@ -1226,7 +1230,7 @@ impl Builder {
         // same name ≤ 500 m apart, a parent station and its children ≤ 2 km,
         // and children of the same parent ≤ 500 m are connected by footpaths,
         // whatever the generic radius is (platforms of large stations).
-        let station = station_links(&self.stops, &served, &self.stop_feed);
+        let station = station_links(&self.stops, &walkable, &self.stop_feed);
         let motis = self.opts.motis_footpaths;
         let speed = self.opts.walk_speed_m_per_s;
         generated.extend(station.iter().map(|&(a, b, d)| {
@@ -1240,14 +1244,15 @@ impl Builder {
         let mut explicit = std::mem::take(&mut self.footpaths);
         if self.opts.motis_footpaths {
             generated.retain(|_| false);
+            let metas = motis_metas(&self.stops, &walkable, &self.stop_feed, &station);
             generated.extend(
-                station
+                metas
                     .iter()
                     .map(|&(a, b, d)| (a, b, ((d / 1.5) / 60.0).ceil().max(2.0) as u32 * 60)),
             );
             let (feed, change) = (&self.stop_feed, &self.change);
             let mut near = Vec::new();
-            link_nearby(&self.stops, &served, 300.0, 1.0, &mut near);
+            link_nearby(&self.stops, &walkable, 300.0, 1.0, &mut near);
             near.retain_mut(|(a, b, d)| {
                 let dist = *d as f64; // speed 1.0 → seconds == metres (rounded up)
                 if feed[*a as usize] == feed[*b as usize] {
@@ -1282,6 +1287,7 @@ impl Builder {
         }
         let foot = close_footpaths(
             n_stops,
+            &served,
             generated,
             explicit,
             &self.forbidden,
@@ -1528,6 +1534,81 @@ pub fn haversine(a: (f64, f64), b: (f64, f64)) -> f64 {
     2.0 * 6_371_000.0 * h.sqrt().asin()
 }
 
+/// nigiri's "metas" (comparison mode): within a feed, every stop reachable
+/// from `s` over hops of ≤ 100 m, same-name links and parent/child relations
+/// is linked to `s` if it is ≤ 500 m away (≤ 2 km for parent/child), with the
+/// direct distance. `station` are the same-name/parent/sibling links.
+fn motis_metas(
+    stops: &[Stop],
+    served: &[bool],
+    feed: &[u32],
+    station: &[(u32, u32, f64)],
+) -> Vec<(u32, u32, f64)> {
+    let n = stops.len();
+    let mut close = Vec::new();
+    link_nearby(stops, served, 100.0, 1.0, &mut close);
+    let mut adj: Vec<Vec<u32>> = vec![Vec::new(); n];
+    for &(a, b, _) in &close {
+        if feed[a as usize] == feed[b as usize] {
+            adj[a as usize].push(b);
+        }
+    }
+    for &(a, b, _) in station {
+        adj[a as usize].push(b);
+    }
+    let coord = |i: u32| stops[i as usize].lat.zip(stops[i as usize].lon);
+    let direct: HashSet<(u32, u32)> = station
+        .iter()
+        .filter(|e| e.2 > 500.0)
+        .map(|e| (e.0, e.1))
+        .collect();
+    let mut out = Vec::new();
+    let mut seen: HashSet<u32> = HashSet::new();
+    let mut todo: Vec<u32> = Vec::new();
+    for s in 0..n as u32 {
+        let Some(cs) = coord(s) else { continue };
+        if !served[s as usize] || adj[s as usize].is_empty() {
+            continue;
+        }
+        seen.clear();
+        todo.clear();
+        seen.insert(s);
+        todo.push(s);
+        while let Some(u) = todo.pop() {
+            for &v in &adj[u as usize] {
+                if seen.contains(&v) {
+                    continue;
+                }
+                let Some(cv) = coord(v) else { continue };
+                // prune: only nodes within the 500 m result radius (plus a
+                // margin for chains) can qualify; far parent/child pairs are
+                // added directly below
+                if haversine(cs, cv) > 600.0 {
+                    continue;
+                }
+                seen.insert(v);
+                todo.push(v);
+            }
+        }
+        for &t in &seen {
+            if t == s {
+                continue;
+            }
+            let d = haversine(cs, coord(t).unwrap());
+            if d <= 500.0 {
+                out.push((s, t, d));
+            }
+        }
+    }
+    out.extend(
+        station
+            .iter()
+            .filter(|e| direct.contains(&(e.0, e.1)))
+            .copied(),
+    );
+    out
+}
+
 /// Same-feed station links (see the caller): `(from, to, metres)`, both
 /// directions, served stops only.
 fn station_links(stops: &[Stop], served: &[bool], feed: &[u32]) -> Vec<(u32, u32, f64)> {
@@ -1656,6 +1737,7 @@ fn link_nearby(
 /// a chain would be shorter; forbidden pairs (type 3) are removed.
 fn close_footpaths(
     n: usize,
+    served: &[bool],
     generated: Vec<(u32, u32, u32)>,
     explicit: Vec<(u32, u32, u32)>,
     forbidden: &HashSet<(u32, u32)>,
@@ -1712,7 +1794,14 @@ fn close_footpaths(
         }
         let mut v: Vec<(u32, u32, u32)> = dist
             .iter()
-            .filter(|&(&t, _)| t as usize != s && !forbidden.contains(&(s as u32, t)))
+            // a footpath between two unserved stops is never used (walks are
+            // not chained; endpoints of a walk are a source, a target or a
+            // stop with service)
+            .filter(|&(&t, _)| {
+                t as usize != s
+                    && (served[s] || served[t as usize])
+                    && !forbidden.contains(&(s as u32, t))
+            })
             .map(|(&t, &d)| (s as u32, t, d))
             .collect();
         v.sort_unstable();

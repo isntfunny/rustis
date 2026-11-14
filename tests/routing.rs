@@ -633,3 +633,23 @@ fn same_name_and_same_station_stops_are_linked_without_a_radius() {
     let (_t, s) = import_feed(&[("transfers.txt", no_rules)]);
     assert_eq!(transit_trips(&s.plan(&request()).unwrap(), 0), ["SLOW"]);
 }
+
+#[test]
+fn walks_may_pass_unserved_stops() {
+    // D is 500 m north of B; only the unserved X in between is within the
+    // 260 m link radius of both.
+    let no_rules = "from_stop_id,to_stop_id,transfer_type,min_transfer_time\n";
+    let stops = "stop_id,stop_name,stop_lat,stop_lon\nA,Origin,50.000,8.000\nB,Interchange west,50.010,8.010\nC,Destination,50.020,8.020\nD,Interchange east,50.0145,8.010\nX,Passage,50.01225,8.010\n";
+    let mut opts = rustis::BuildOptions::for_date("2026-11-16");
+    opts.link_radius_m = 260.0;
+    opts.walk_speed_m_per_s = 2.0;
+    let (_t, s) = import_with(&[("transfers.txt", no_rules), ("stops.txt", stops)], &opts);
+    let r = s.plan(&request()).unwrap();
+    assert_eq!(transit_trips(&r, 0), ["T1", "T2"]);
+    let walk = r.itineraries[0]
+        .legs
+        .iter()
+        .find(|l| l.kind == LegKind::Walk)
+        .unwrap();
+    assert_eq!(walk.to.as_ref().unwrap().stop_id, "D");
+}
