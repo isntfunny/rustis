@@ -238,11 +238,11 @@ async fn default_motis_keeps_bus_when_faster_flex_exists() {
         "route_id,service_id,trip_id\nr,s,t\nr,s,bus\n",
     )
     .unwrap();
-    std::fs::write(feed.join("stop_times.txt"),"trip_id,stop_sequence,stop_id,arrival_time,departure_time,location_group_id,start_pickup_drop_off_window,end_pickup_drop_off_window,pickup_type,drop_off_type\nt,1,,,,g1,25:00:00,26:00:00,2,1\nt,2,,,,g2,25:00:00,27:00:00,1,2\nbus,1,A,25:00:00,25:00:00,,,,0,1\nbus,2,B,26:00:00,26:00:00,,,,1,0\n").unwrap();
+    std::fs::write(feed.join("stop_times.txt"),"trip_id,stop_sequence,stop_id,arrival_time,departure_time,location_group_id,start_pickup_drop_off_window,end_pickup_drop_off_window,pickup_type,drop_off_type\nt,1,,,,g1,25:00:00,26:00:00,2,1\nt,2,,,,g2,25:00:00,27:00:00,1,2\nbus,1,A,25:30:00,25:30:00,,,,0,1\nbus,2,B,25:35:00,25:35:00,,,,1,0\n").unwrap();
     let out = t.path().join("mixed");
     import_gtfs_with(&feed, &out, &BuildOptions::for_date("2026-11-16")).unwrap();
     let app = rustis::http::router(std::sync::Arc::new(Snapshot::open(&out).unwrap()), 1);
-    for modes in ["", "&transitModes=BUS"] {
+    for modes in ["", "&transitModes=BUS", "&transitModes=FLEX"] {
         let uri = format!(
             "/api/v6/plan?fromPlace=A&toPlace=B&time=2026-11-17T00:00:00Z&numItineraries=1{modes}"
         );
@@ -253,6 +253,77 @@ async fn default_motis_keeps_bus_when_faster_flex_exists() {
             .unwrap();
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["itineraries"][0]["legs"][0]["mode"], "BUS", "{json}");
+        if modes.ends_with("FLEX") {
+            assert_eq!(
+                json["itineraries"][0]["endTime"], "2026-11-17T00:38:22Z",
+                "{json}"
+            );
+        } else {
+            assert_eq!(json["itineraries"][0]["legs"][0]["mode"], "BUS", "{json}");
+        }
     }
+}
+
+#[test]
+fn flex_to_timed_preserves_trip_specific_prohibition() {
+    let (t, _, req) = fixture(false);
+    let feed = t.path().join("feed");
+    std::fs::write(
+        feed.join("stops.txt"),
+        "stop_id,stop_name,stop_lat,stop_lon\nA,A,46,14\nB,B,46.1,14\nC,C,45,14\n",
+    )
+    .unwrap();
+    std::fs::write(
+        feed.join("trips.txt"),
+        "route_id,service_id,trip_id\nr,s,t\nr,s,exit\n",
+    )
+    .unwrap();
+    std::fs::write(feed.join("stop_times.txt"),"trip_id,stop_sequence,stop_id,arrival_time,departure_time,location_group_id,start_pickup_drop_off_window,end_pickup_drop_off_window,pickup_type,drop_off_type\nt,1,,,,g1,25:00:00,26:00:00,2,1\nt,2,,,,g2,25:00:00,27:00:00,1,2\nexit,1,B,25:50:00,25:50:00,,,,0,1\nexit,2,C,26:00:00,26:00:00,,,,1,0\n").unwrap();
+    let req = PlanRequest {
+        to: vec![Endpoint {
+            stop_id: "C".into(),
+            walk_seconds: 0,
+        }],
+        max_transfers: 1,
+        ..req
+    };
+    for restricted in [false, true] {
+        if restricted {
+            std::fs::write(
+                feed.join("transfers.txt"),
+                "from_stop_id,to_stop_id,from_trip_id,to_trip_id,transfer_type\nB,B,t,exit,3\n",
+            )
+            .unwrap();
+        }
+        let dest = t.path().join(format!("exit-{restricted}"));
+        import_gtfs_with(&feed, &dest, &BuildOptions::for_date("2026-11-16")).unwrap();
+        let response = Snapshot::open(&dest).unwrap().plan(&req).unwrap();
+        assert_eq!(response.itineraries.is_empty(), restricted);
+        if !restricted {
+            assert_eq!(response.itineraries[0].arrival, 93600);
+        }
+    }
+}
+
+#[test]
+fn identical_services_are_deduplicated() {
+    let (t, _, _) = fixture(false);
+    let feed = t.path().join("feed");
+    let trips = std::fs::read_to_string(feed.join("trips.txt")).unwrap();
+    std::fs::write(feed.join("trips.txt"), trips + "r,s,twin\n").unwrap();
+    let times = std::fs::read_to_string(feed.join("stop_times.txt")).unwrap();
+    let twin = times
+        .lines()
+        .skip(1)
+        .map(|l| l.replacen("t,", "twin,", 1))
+        .collect::<Vec<_>>()
+        .join("\n");
+    std::fs::write(feed.join("stop_times.txt"), times + &twin + "\n").unwrap();
+    let m = import_gtfs_with(
+        &feed,
+        &t.path().join("dedup"),
+        &BuildOptions::for_date("2026-11-16"),
+    )
+    .unwrap();
+    assert_eq!(m.feeds[0].flex_services, 1);
 }

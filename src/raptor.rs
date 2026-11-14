@@ -97,6 +97,7 @@ pub struct WalkLabel {
 
 pub struct Query<'a> {
     pub allow_flex: bool,
+    pub allow_timed: bool,
     pub sources: &'a [(u32, u32)],
     pub targets: &'a [(u32, u32)],
     /// Earliest departure from the rider's position (relative seconds).
@@ -384,6 +385,9 @@ impl Search<'_, '_, '_> {
             marked.sort_unstable();
             marked.dedup();
             for &s in &marked {
+                if !self.q.allow_timed {
+                    continue;
+                }
                 let (a, b) = (
                     tt.stop_route_off[s as usize] as usize,
                     tt.stop_route_off[s as usize + 1] as usize,

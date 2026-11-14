@@ -182,13 +182,14 @@ impl Snapshot {
     }
 
     pub fn plan(&self, q: &PlanRequest) -> Result<PlanResponse, Error> {
-        self.plan_with_flex(q, true)
+        self.plan_with_modes(q, true, true)
     }
 
-    pub(crate) fn plan_with_flex(
+    pub(crate) fn plan_with_modes(
         &self,
         q: &PlanRequest,
         allow_flex: bool,
+        allow_timed: bool,
     ) -> Result<PlanResponse, Error> {
         if q.max_transfers > MAX_TRANSFERS {
             return Err(Error::invalid(format!(
@@ -285,6 +286,7 @@ impl Snapshot {
             for w in windows {
                 let query = Query {
                     allow_flex,
+                    allow_timed,
                     sources: &from.stops,
                     targets: &to.stops,
                     depart,

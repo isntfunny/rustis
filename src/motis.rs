@@ -489,7 +489,10 @@ pub fn plan(snap: &Snapshot, q: &PlanQuery, body: &PlanBody) -> Result<Value, Er
     let allow_flex = modes
         .as_ref()
         .is_some_and(|m| m.iter().any(|x| x == "FLEX" || x == "ODM"));
-    let resp = snap.plan_with_flex(&req, allow_flex)?;
+    let allow_timed = modes
+        .as_ref()
+        .is_none_or(|m| m.iter().any(|x| x != "FLEX" && x != "ODM"));
+    let resp = snap.plan_with_modes(&req, allow_flex, allow_timed)?;
     let mut sorted: Vec<&Itinerary> = resp.itineraries.iter().collect();
     // MOTIS lists the journeys of the window by departure
     sorted.sort_by_key(|it| (it.departure, it.arrival));
