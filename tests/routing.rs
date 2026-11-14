@@ -617,3 +617,19 @@ fn dates_without_any_service_are_answered_without_searching() {
     assert!(!r.itineraries.is_empty());
     assert!(!r.warnings.iter().any(|w| w.starts_with("NO SERVICE")));
 }
+
+#[test]
+fn same_name_and_same_station_stops_are_linked_without_a_radius() {
+    // B and D (≈110 m apart) without transfers.txt rows and without generic
+    // linking: only the station link (same name / same parent) connects them.
+    let no_rules = "from_stop_id,to_stop_id,transfer_type,min_transfer_time\n";
+    let same_name = "stop_id,stop_name,stop_lat,stop_lon\nA,Origin,50.000,8.000\nB,Interchange,50.010,8.010\nC,Destination,50.020,8.020\nD,Interchange,50.011,8.011\n";
+    let (_t, s) = import_feed(&[("transfers.txt", no_rules), ("stops.txt", same_name)]);
+    assert_eq!(transit_trips(&s.plan(&request()).unwrap(), 0), ["T1", "T2"]);
+    let parent = "stop_id,stop_name,stop_lat,stop_lon,location_type,parent_station\nA,Origin,50.000,8.000,0,\nP,Station,50.0105,8.0105,1,\nB,West platform,50.010,8.010,0,P\nC,Destination,50.020,8.020,0,\nD,East platform,50.011,8.011,0,P\n";
+    let (_t, s) = import_feed(&[("transfers.txt", no_rules), ("stops.txt", parent)]);
+    assert_eq!(transit_trips(&s.plan(&request()).unwrap(), 0), ["T1", "T2"]);
+    // Different names, no parent: no connection (the direct SLOW wins).
+    let (_t, s) = import_feed(&[("transfers.txt", no_rules)]);
+    assert_eq!(transit_trips(&s.plan(&request()).unwrap(), 0), ["SLOW"]);
+}

@@ -58,6 +58,7 @@ pub struct Timetable {
     pub route_info: Array<u32>,
     pub route_max_time: Array<u32>,
     pub route_info_type: Array<u16>,
+    #[allow(dead_code)] // kept for diagnostics (route service days)
     pub route_days: Array<u32>,
     pub stop_days: Array<u32>,
     pub bitfields: Array<u64>,

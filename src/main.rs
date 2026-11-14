@@ -51,6 +51,9 @@ enum Cmd {
         /// Treat pickup/drop_off 2/3 (booking) as not available.
         #[arg(long)]
         exclude_booking_stops: bool,
+        /// Comparison mode: footpaths/change times built like MOTIS (nigiri).
+        #[arg(long)]
+        motis_footpaths: bool,
     },
     /// Plan a journey against a snapshot.
     Plan {
@@ -167,6 +170,7 @@ fn main() -> Result<()> {
             max_footpath_secs,
             default_change_seconds,
             exclude_booking_stops,
+            motis_footpaths,
         } => {
             let mut feeds: Vec<FeedSpec> = Vec::new();
             if let Some(cfg) = motis_config {
@@ -211,6 +215,7 @@ fn main() -> Result<()> {
             opts.max_footpath_secs = max_footpath_secs;
             opts.default_change_seconds = default_change_seconds;
             opts.exclude_booking_stops = exclude_booking_stops;
+            opts.motis_footpaths = motis_footpaths;
             let m = build_snapshot(&feeds, &out, opts)?;
             let failed: Vec<_> = m.feeds.iter().filter(|f| !f.imported).collect();
             println!(

@@ -48,6 +48,11 @@ pub struct BuildOptions {
     pub default_change_seconds: u32,
     /// Treat pickup/drop_off 2/3 (booking) as not available.
     pub exclude_booking_stops: bool,
+    /// Comparison mode: footpaths and change times as MOTIS/nigiri builds them
+    /// (within a feed only stops ≤ 100 m apart, ≥ 2 min; across feeds ≤ 300 m
+    /// at 1.5 m/s in whole minutes; transfers.txt footpaths made symmetric;
+    /// minute-truncated rule times; the *shortest* same-stop rule wins).
+    pub motis_footpaths: bool,
 }
 
 impl BuildOptions {
@@ -64,6 +69,7 @@ impl BuildOptions {
             max_footpath_secs: 720,
             default_change_seconds: 0,
             exclude_booking_stops: false,
+            motis_footpaths: false,
         }
     }
 }
@@ -168,6 +174,8 @@ pub struct Builder {
     dir: PathBuf,
     words: usize,
     tz_names: Vec<String>,
+    /// Index of the feed (in `feeds`) each stop came from.
+    stop_feed: Vec<u32>,
     stops: Vec<Stop>,
     stop_tz: Vec<u16>,
     change: Vec<u32>,
@@ -269,6 +277,7 @@ impl Builder {
             words,
             tz_names: Vec::new(),
             stops: Vec::new(),
+            stop_feed: Vec::new(),
             stop_tz: Vec::new(),
             change: Vec::new(),
             bitfields: HashMap::new(),
@@ -969,15 +978,30 @@ impl Builder {
 
     fn commit_inner(&mut self, d: FeedData) -> Result<FeedReport> {
         let base = self.stops.len() as u32;
+        let feed_no = self.feeds.len() as u32;
+        self.stop_feed
+            .extend(std::iter::repeat_n(feed_no, d.stops.len()));
         self.stops.extend(d.stops);
         self.stop_tz.extend(d.stop_tz);
         self.change
             .resize(self.stops.len(), self.opts.default_change_seconds);
         let mut explicit: HashMap<u32, u32> = HashMap::new();
+        let motis = self.opts.motis_footpaths;
         for (s, secs) in d.change {
-            // several rows for one stop: the strictest one wins
-            let e = explicit.entry(s).or_insert(0);
-            *e = (*e).max(secs);
+            // several rows for one stop: the strictest one wins (MOTIS mode:
+            // the shortest, in whole minutes, as nigiri does)
+            if motis {
+                let secs = if secs == FORBIDDEN {
+                    secs
+                } else {
+                    secs / 60 * 60
+                };
+                let e = explicit.entry(s).or_insert(u32::MAX);
+                *e = (*e).min(secs);
+            } else {
+                let e = explicit.entry(s).or_insert(0);
+                *e = (*e).max(secs);
+            }
         }
         for (s, secs) in explicit {
             self.change[s as usize] = secs;
@@ -1138,7 +1162,64 @@ impl Builder {
                 &mut generated,
             );
         }
-        let explicit = std::mem::take(&mut self.footpaths);
+        // Station links (as nigiri's "metas"): within a feed, stops with the
+        // same name ≤ 500 m apart, a parent station and its children ≤ 2 km,
+        // and children of the same parent ≤ 500 m are connected by footpaths,
+        // whatever the generic radius is (platforms of large stations).
+        let station = station_links(&self.stops, &served, &self.stop_feed);
+        let motis = self.opts.motis_footpaths;
+        let speed = self.opts.walk_speed_m_per_s;
+        generated.extend(station.iter().map(|&(a, b, d)| {
+            let secs = if motis {
+                ((d / 1.5) / 60.0).ceil().max(2.0) as u32 * 60
+            } else {
+                (d / speed).ceil() as u32
+            };
+            (a, b, secs)
+        }));
+        let mut explicit = std::mem::take(&mut self.footpaths);
+        if self.opts.motis_footpaths {
+            generated.retain(|_| false);
+            generated.extend(
+                station
+                    .iter()
+                    .map(|&(a, b, d)| (a, b, ((d / 1.5) / 60.0).ceil().max(2.0) as u32 * 60)),
+            );
+            let (feed, change) = (&self.stop_feed, &self.change);
+            let mut near = Vec::new();
+            link_nearby(&self.stops, &served, 300.0, 1.0, &mut near);
+            near.retain_mut(|(a, b, d)| {
+                let dist = *d as f64; // speed 1.0 → seconds == metres (rounded up)
+                if feed[*a as usize] == feed[*b as usize] {
+                    if dist > 100.0 {
+                        return false;
+                    }
+                    *d = (((dist / 1.5) / 60.0).ceil().max(2.0) * 60.0) as u32;
+                } else {
+                    let walk = ((dist / 1.5) / 60.0).round() * 60.0;
+                    let ct = |s: u32| {
+                        if change[s as usize] == FORBIDDEN {
+                            0
+                        } else {
+                            change[s as usize]
+                        }
+                    };
+                    *d = (walk as u32).max(ct(*a)).max(ct(*b));
+                }
+                true
+            });
+            generated.extend(near);
+            for e in explicit.iter_mut() {
+                e.2 = e.2 / 60 * 60;
+            }
+            let have: HashSet<(u32, u32)> = explicit.iter().map(|e| (e.0, e.1)).collect();
+            let rev: Vec<_> = explicit
+                .iter()
+                .filter(|e| !have.contains(&(e.1, e.0)))
+                .map(|e| (e.1, e.0, e.2))
+                .collect();
+            explicit.extend(rev);
+        }
         let foot = close_footpaths(
             n_stops,
             generated,
@@ -1385,6 +1466,83 @@ pub fn haversine(a: (f64, f64), b: (f64, f64)) -> f64 {
     let h = ((la2 - la1) / 2.0).sin().powi(2)
         + la1.cos() * la2.cos() * ((lo2 - lo1) / 2.0).sin().powi(2);
     2.0 * 6_371_000.0 * h.sqrt().asin()
+}
+
+/// Same-feed station links (see the caller): `(from, to, metres)`, both
+/// directions, served stops only.
+fn station_links(stops: &[Stop], served: &[bool], feed: &[u32]) -> Vec<(u32, u32, f64)> {
+    let coord = |i: usize| stops[i].lat.zip(stops[i].lon);
+    let mut by_name: HashMap<(u32, &str), Vec<u32>> = HashMap::new();
+    let mut id_index: HashMap<&str, u32> = HashMap::new();
+    for (i, s) in stops.iter().enumerate() {
+        id_index.insert(s.stop_id.as_str(), i as u32);
+        if served[i] && coord(i).is_some() && !s.name.is_empty() {
+            by_name
+                .entry((feed[i], s.name.as_str()))
+                .or_default()
+                .push(i as u32);
+        }
+    }
+    let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
+    for (i, s) in stops.iter().enumerate() {
+        if let Some(p) = s.parent_station.as_deref().and_then(|p| id_index.get(p))
+            && coord(i).is_some()
+        {
+            children.entry(*p).or_default().push(i as u32);
+        }
+    }
+    let mut out: HashSet<(u32, u32)> = HashSet::new();
+    let mut res = Vec::new();
+    let mut add = |a: u32, b: u32, max: f64, res: &mut Vec<(u32, u32, f64)>| {
+        if a == b || !served[a as usize] || !served[b as usize] {
+            return;
+        }
+        let (Some(p), Some(q)) = (coord(a as usize), coord(b as usize)) else {
+            return;
+        };
+        let d = haversine(p, q);
+        if d <= max && out.insert((a, b)) {
+            res.push((a, b, d));
+            if out.insert((b, a)) {
+                res.push((b, a, d));
+            }
+        }
+    };
+    for v in by_name.values() {
+        if v.len() < 2 {
+            continue;
+        }
+        // sort by latitude: only stops within 500 m in latitude can match
+        let mut v = v.clone();
+        v.sort_by(|&a, &b| {
+            coord(a as usize)
+                .unwrap()
+                .0
+                .total_cmp(&coord(b as usize).unwrap().0)
+        });
+        for i in 0..v.len() {
+            let la = coord(v[i] as usize).unwrap().0;
+            for &b in &v[i + 1..] {
+                if coord(b as usize).unwrap().0 - la > 500.0 / 111_000.0 {
+                    break;
+                }
+                add(v[i], b, 500.0, &mut res);
+            }
+        }
+    }
+    for (&p, kids) in &children {
+        for (k, &a) in kids.iter().enumerate() {
+            if coord(p as usize).is_some() {
+                add(p, a, 2000.0, &mut res);
+            }
+            if kids.len() <= 400 {
+                for &b in &kids[k + 1..] {
+                    add(a, b, 500.0, &mut res);
+                }
+            }
+        }
+    }
+    res
 }
 
 /// Footpaths between served stops closer than `radius` (grid hashing).
