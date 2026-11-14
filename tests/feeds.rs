@@ -302,7 +302,7 @@ fn several_feeds_are_namespaced_and_linked_by_generated_footpaths() {
             .error
             .as_deref()
             .unwrap()
-            .contains("not a GTFS feed")
+            .contains("invalid NeTEx publication")
     );
     assert!(
         m.warnings.iter().any(|w| w.contains("not imported: netex")),

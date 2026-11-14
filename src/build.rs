@@ -15,6 +15,9 @@
 //! * routes = trips with identical stop sequence and pickup/drop-off flags,
 //!   split so trips never overtake each other (also across service days);
 //! * frequencies.txt trips are expanded into individual trips.
+#[path = "netex.rs"]
+mod netex;
+
 use crate::catalog;
 use crate::feed::{Feed, field, parse_date, parse_time, text};
 use crate::model::Stop;
@@ -436,6 +439,10 @@ impl Parser<'_> {
         let name = spec.name.as_str();
         let mut feed = Feed::open(&spec.path)?;
         let members = feed.members();
+        if !members.iter().any(|m| m == "stops.txt") && members.iter().any(|m| m.ends_with(".xml"))
+        {
+            return netex::read(self, spec);
+        }
         for f in ["stops.txt", "trips.txt", "stop_times.txt", "routes.txt"] {
             ensure!(
                 members.iter().any(|m| m == f),
@@ -1568,6 +1575,13 @@ impl Builder {
             warnings.push(format!(
                 "{ignored} timed/in-seat/recommended transfer rule(s) are not exploited (results valid, possibly incomplete)"
             ));
+        }
+        for feed in &self.feeds {
+            for (key, count) in &feed.skipped {
+                if key.starts_with("netex_") && *count > 0 {
+                    warnings.push(format!("{}: {key} ({count})", feed.name));
+                }
+            }
         }
         let meta = SnapshotMeta {
             version: SNAPSHOT_VERSION,

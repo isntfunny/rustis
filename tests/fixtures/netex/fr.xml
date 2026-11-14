@@ -1,0 +1,12 @@
+<PublicationDelivery xmlns="http://www.netex.org.uk/netex"><dataObjects>
+<FrameDefaults><DefaultLocale><TimeZoneOffset>+1</TimeZoneOffset><SummerTimeZoneOffset>+2</SummerTimeZoneOffset></DefaultLocale></FrameDefaults>
+<StopPlace id="A"><Name>Annecy &amp; Gare</Name><Centroid><Location><Latitude>45.9</Latitude><Longitude>6.1</Longitude></Location></Centroid></StopPlace>
+<StopPlace id="B"><Name>Chamonix</Name><Centroid><Location><Latitude>45.9</Latitude><Longitude>6.8</Longitude></Location></Centroid></StopPlace>
+<PassengerStopAssignment id="a"><ScheduledStopPointRef ref="sa"/><StopPlaceRef ref="A"/></PassengerStopAssignment>
+<PassengerStopAssignment id="b"><ScheduledStopPointRef ref="sb"/><StopPlaceRef ref="B"/></PassengerStopAssignment>
+<Line id="L"><Name>TER</Name><TransportMode>rail</TransportMode></Line>
+<UicOperatingPeriod id="op"><FromDate>2026-11-14T00:00:00</FromDate><ToDate>2026-11-16T23:59:59</ToDate><ValidDayBits>101</ValidDayBits></UicOperatingPeriod>
+<DayTypeAssignment id="d"><OperatingPeriodRef ref="op"/><DayTypeRef ref="day"/></DayTypeAssignment>
+<ServiceJourneyPattern id="jp"><pointsInSequence><StopPointInJourneyPattern id="p1" order="1"><ScheduledStopPointRef ref="sa"/></StopPointInJourneyPattern><StopPointInJourneyPattern id="p2" order="2"><ScheduledStopPointRef ref="sb"/></StopPointInJourneyPattern></pointsInSequence></ServiceJourneyPattern>
+<ServiceJourney id="J"><LineRef ref="L"/><dayTypes><DayTypeRef ref="day"/></dayTypes><JourneyPatternRef ref="jp"/><passingTimes><TimetabledPassingTime><PointInJourneyPatternRef ref="p1"/><DepartureTime>23:30:00</DepartureTime></TimetabledPassingTime><TimetabledPassingTime><PointInJourneyPatternRef ref="p2"/><ArrivalTime>00:30:00</ArrivalTime><ArrivalDayOffset>1</ArrivalDayOffset></TimetabledPassingTime></passingTimes></ServiceJourney>
+</dataObjects></PublicationDelivery>
