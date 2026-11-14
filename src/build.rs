@@ -31,7 +31,7 @@ pub const FLAG_DROP_OFF_BOOKING: u8 = 8;
 /// Change time value meaning "no transfer possible at this stop" (type 3).
 pub const FORBIDDEN: u32 = u32::MAX;
 pub const NONE: u32 = u32::MAX;
-pub const SNAPSHOT_VERSION: u32 = 3;
+pub const SNAPSHOT_VERSION: u32 = 4;
 
 #[derive(Clone, Debug)]
 pub struct BuildOptions {
@@ -186,6 +186,8 @@ pub struct Builder {
     route_tz: Vec<u16>,
     route_info: Vec<u32>,
     route_max_time: Vec<u32>,
+    /// Union of the traffic days of a route's trips (bitfield index).
+    route_days: Vec<u32>,
     trip_bits: ArrayWriter<u32>,
     trip_gtfs: ArrayWriter<u32>,
     dep: ArrayWriter<u32>,
@@ -284,6 +286,7 @@ impl Builder {
             route_tz: Vec::new(),
             route_info: Vec::new(),
             route_max_time: Vec::new(),
+            route_days: Vec::new(),
             trip_bits: ArrayWriter::create(dir, "trip_bits")?,
             trip_gtfs: ArrayWriter::create(dir, "trip_gtfs")?,
             dep: ArrayWriter::create(dir, "dep")?,
@@ -1016,6 +1019,15 @@ impl Builder {
         self.route_stops.extend_from_slice(stops);
         self.route_flags.extend_from_slice(flags);
         self.route_stop_off.push(self.route_stops.len() as u64);
+        let mut days = vec![0u64; self.words];
+        for t in &trips {
+            let b = t.bits as usize * self.words;
+            for (w, x) in days.iter_mut().zip(&self.bitfield_table[b..b + self.words]) {
+                *w |= x;
+            }
+        }
+        let days = self.bitfield(&days);
+        self.route_days.push(days);
         for t in &trips {
             self.trip_bits.push(t.bits)?;
             self.trip_gtfs.push(t.gtfs)?;
@@ -1053,7 +1065,8 @@ impl Builder {
     /// Writes all remaining arrays, the catalogue and `snapshot.json`.
     pub fn finish(mut self, t0: std::time::Instant) -> Result<SnapshotMeta> {
         let dir = self.dir.clone();
-        let m = &mut self.manifest;
+        let mut manifest = std::mem::take(&mut self.manifest);
+        let m = &mut manifest;
         let n_stops = self.stops.len();
         let n_routes = self.route_tz.len();
         // stop → (route, position)
@@ -1072,6 +1085,27 @@ impl Builder {
         let off = csr_offsets(n_stops, sr.iter().map(|e| e.0));
         for e in &sr {
             served[e.0 as usize] = true;
+        }
+        // Days on which any trip serves the stop (union over its routes):
+        // lets the router answer "no service" without searching.
+        let mut stop_days = vec![crate::build::NONE; n_stops];
+        {
+            let words = self.words;
+            let mut acc = vec![0u64; words];
+            let mut i = 0;
+            while i < sr.len() {
+                let s = sr[i].0;
+                acc.iter_mut().for_each(|w| *w = 0);
+                while i < sr.len() && sr[i].0 == s {
+                    let b = self.route_days[sr[i].1 as usize] as usize * words;
+                    for (w, x) in acc.iter_mut().zip(&self.bitfield_table[b..b + words]) {
+                        *w |= x;
+                    }
+                    i += 1;
+                }
+                let acc2 = acc.clone();
+                stop_days[s as usize] = self.bitfield(&acc2);
+            }
         }
         write_all(&dir, "stop_route_off", &off, m)?;
         write_all(
@@ -1188,6 +1222,8 @@ impl Builder {
         write_all(&dir, "route_tz", &self.route_tz, m)?;
         write_all(&dir, "route_info", &self.route_info, m)?;
         write_all(&dir, "route_max_time", &self.route_max_time, m)?;
+        write_all(&dir, "route_days", &self.route_days, m)?;
+        write_all(&dir, "stop_days", &stop_days, m)?;
         write_all(&dir, "route_info_type", &self.route_info_type, m)?;
         write_all(&dir, "bitfields", &self.bitfield_table, m)?;
         let n_trips = self.trip_bits.len() as usize;
@@ -1278,7 +1314,7 @@ impl Builder {
             exclude_booking_stops: self.opts.exclude_booking_stops,
             feeds: self.feeds,
             warnings,
-            manifest: self.manifest,
+            manifest,
             build_seconds: t0.elapsed().as_secs_f64(),
         };
         Ok(meta)

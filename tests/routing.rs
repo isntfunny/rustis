@@ -598,3 +598,22 @@ fn exhausted_search_budget_is_reported_not_hidden() {
             .any(|w| w.starts_with("SEARCH LIMIT"))
     );
 }
+
+#[test]
+fn dates_without_any_service_are_answered_without_searching() {
+    // The fixture's calendar ends 2026-12-31; the horizon (366 days) goes on.
+    let (_tmp, s) = imported();
+    let r = s.plan(&request_on("2027-01-06")).unwrap();
+    assert!(r.itineraries.is_empty());
+    assert!(
+        r.warnings
+            .iter()
+            .any(|w| w.starts_with("NO SERVICE: no trip serves any origin")),
+        "{:?}",
+        r.warnings
+    );
+    // Service on the last calendar day is still found (no false "no service").
+    let r = s.plan(&request_on("2026-12-31")).unwrap();
+    assert!(!r.itineraries.is_empty());
+    assert!(!r.warnings.iter().any(|w| w.starts_with("NO SERVICE")));
+}

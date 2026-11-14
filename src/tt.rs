@@ -58,6 +58,8 @@ pub struct Timetable {
     pub route_info: Array<u32>,
     pub route_max_time: Array<u32>,
     pub route_info_type: Array<u16>,
+    pub route_days: Array<u32>,
+    pub stop_days: Array<u32>,
     pub bitfields: Array<u64>,
     pub trip_bits: Array<u32>,
     pub trip_gtfs: Array<u32>,
@@ -149,6 +151,8 @@ impl Timetable {
             route_info: a!("route_info"),
             route_max_time: a!("route_max_time"),
             route_info_type: a!("route_info_type"),
+            route_days: a!("route_days"),
+            stop_days: a!("stop_days"),
             bitfields: a!("bitfields"),
             trip_bits: a!("trip_bits"),
             trip_gtfs: a!("trip_gtfs"),
@@ -291,6 +295,13 @@ impl Timetable {
         let n = (self.route_trip_off[r + 1] - self.route_trip_off[r]) as usize;
         let a = self.route_time_off[r] as usize + pos * n;
         &self.arr[a..a + n]
+    }
+    /// Whether any trip serves stop `s` on a service day in `lo..=hi`
+    /// (bit indices; conservative helper for the "no service" pre-check).
+    pub fn served_between(&self, s: usize, lo: usize, hi: usize) -> bool {
+        let b = self.stop_days[s];
+        b != crate::build::NONE
+            && (lo..=hi.min(self.days.saturating_sub(1))).any(|d| self.active(b, d))
     }
     pub fn served(&self, s: usize) -> bool {
         self.stop_route_off[s + 1] > self.stop_route_off[s]

@@ -153,6 +153,26 @@ impl Snapshot {
         }
         let to_local = |t: u32| -> u32 { (i64::from(t) + self.tt.origin - midnight).max(0) as u32 };
 
+        // Exact, cheap pre-check: if no origin stop (or stop within a footpath)
+        // has any service in the search period, or likewise no target stop,
+        // there is no journey – answer without searching.
+        if let Some(side) =
+            self.no_service(&from.stops, &to.stops, rel as u32, q.max_travel_seconds, tz)
+        {
+            let mut warnings = self.warnings();
+            warnings.push(format!(
+                "NO SERVICE: no trip serves any {side} stop (or a stop within walking distance) between {} and \
+                 {} + max_travel_seconds; no journey exists in the imported data.",
+                q.date, q.date
+            ));
+            return Ok(PlanResponse {
+                service_date: q.date.clone(),
+                timezone: self.tt.meta.timezones[tz].clone(),
+                itineraries: Vec::new(),
+                omitted_unreconstructable: 0,
+                warnings,
+            });
+        }
         let t0 = std::time::Instant::now();
         let mut found: Vec<(Journey, u32)> = Vec::new();
         let mut depart = rel as u32;
@@ -296,6 +316,43 @@ impl Snapshot {
             omitted_unreconstructable: omitted,
             warnings,
         })
+    }
+
+    /// `Some("origin"|"destination")` if that side has no service at all in
+    /// the period the search could use (conservative: the period is widened
+    /// by the longest trip span and footpath neighbours count as served).
+    fn no_service(
+        &self,
+        from: &[(u32, u32)],
+        to: &[(u32, u32)],
+        depart: u32,
+        max_travel: u32,
+        tz: usize,
+    ) -> Option<&'static str> {
+        let tt = &self.tt;
+        let base = &tt.base[tz];
+        let d_t = base.partition_point(|&b| b <= depart).saturating_sub(1);
+        let span = (tt.meta.max_time / 86_400) as usize + 1;
+        let lo = d_t.saturating_sub(span + 1);
+        let hi = d_t + (max_travel as usize).div_ceil(86_400) + 1;
+        let served = |s: u32| tt.served_between(s as usize, lo, hi);
+        let near_out = |s: u32| served(s) || tt.footpaths(s).any(|(u, _)| served(u));
+        let near_in = |s: u32| {
+            served(s) || {
+                let (a, b) = (
+                    tt.lb_in_off[s as usize] as usize,
+                    tt.lb_in_off[s as usize + 1] as usize,
+                );
+                tt.lb_in_from[a..b].iter().any(|&u| served(u))
+            }
+        };
+        if !from.iter().any(|&(s, _)| near_out(s)) {
+            return Some("origin");
+        }
+        if !to.iter().any(|&(s, _)| near_in(s)) {
+            return Some("destination");
+        }
+        None
     }
 
     /// When the rider leaves the origin (latest possible) – relative seconds.
