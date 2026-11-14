@@ -115,6 +115,9 @@ enum Cmd {
         listen: std::net::SocketAddr,
         #[arg(long, default_value_t = 2)]
         max_concurrency: usize,
+        /// Per-search label budget (bounds per-query memory/time).
+        #[arg(long, default_value_t = rustis::DEFAULT_MAX_LABELS)]
+        max_labels: usize,
     },
 }
 
@@ -295,8 +298,11 @@ fn main() -> Result<()> {
             snapshot,
             listen,
             max_concurrency,
+            max_labels,
         } => {
-            let s = Arc::new(Snapshot::open(&snapshot)?);
+            let mut s = Snapshot::open(&snapshot)?;
+            s.set_max_labels(max_labels);
+            let s = Arc::new(s);
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(2)
                 .max_blocking_threads(max_concurrency.max(1))

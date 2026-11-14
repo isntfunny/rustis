@@ -578,3 +578,23 @@ fn later_trip_is_used_when_the_earliest_trip_forbids_alighting() {
     assert_eq!(transit_trips(&r, 0), ["LATE"], "{r:#?}");
     assert_eq!(r.itineraries[0].arrival, 8 * 3600 + 24 * 60);
 }
+
+#[test]
+fn exhausted_search_budget_is_reported_not_hidden() {
+    let (_tmp, mut s) = imported();
+    s.set_max_labels(1);
+    let r = s.plan(&request()).unwrap();
+    assert!(
+        r.warnings.iter().any(|w| w.starts_with("SEARCH LIMIT")),
+        "{:?}",
+        r.warnings
+    );
+    let (_tmp2, s2) = imported();
+    assert!(
+        !s2.plan(&request())
+            .unwrap()
+            .warnings
+            .iter()
+            .any(|w| w.starts_with("SEARCH LIMIT"))
+    );
+}

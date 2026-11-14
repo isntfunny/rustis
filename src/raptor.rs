@@ -35,6 +35,29 @@ impl Hasher for Fx {
 }
 pub type FxMap<K, V> = HashMap<K, V, BuildHasherDefault<Fx>>;
 
+/// Dense per-stop `u32` slots, zero-initialised by the allocator (calloc):
+/// pages are only backed by memory once a slot on them is written, so a
+/// search that touches few stops stays small while a huge search costs at
+/// most 4 B per stop instead of a hash-map entry (~16–24 B).
+struct Lazy(Vec<u32>);
+
+impl Lazy {
+    fn new(n: usize) -> Self {
+        Self(vec![0; n])
+    }
+    #[inline]
+    fn get(&self, i: u32) -> Option<u32> {
+        match self.0[i as usize] {
+            0 => None,
+            v => Some(v - 1),
+        }
+    }
+    #[inline]
+    fn set(&mut self, i: u32, v: u32) {
+        self.0[i as usize] = v.min(u32::MAX - 1) + 1;
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum From {
     Ride,
@@ -69,6 +92,10 @@ pub struct Query<'a> {
     pub max_transfers: usize,
     /// Only journeys arriving before `depart + window` are searched.
     pub window: u32,
+    /// Effort cap: the search stops after this many labels (bounds memory
+    /// and time of searches that explore most of the network); the result
+    /// is then flagged as possibly incomplete.
+    pub max_labels: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -110,27 +137,34 @@ pub struct SearchStats {
     pub labels: usize,
     pub lb_settled: usize,
     pub trip_checks: usize,
+    /// The label budget was exhausted (results possibly incomplete).
+    pub truncated: bool,
 }
 
 /// Lazily expanded backward Dijkstra (lower bounds to the targets).
-struct LowerBound<'t> {
+/// Lower bounds to the targets; independent of the departure time, so one
+/// instance is shared by all searches of a request (its settled region only grows).
+pub struct LowerBound<'t> {
     tt: &'t Timetable,
-    dist: FxMap<u32, u32>,
-    settled: FxMap<u32, u32>,
+    dist: Lazy,
+    settled: Lazy,
+    n_settled: usize,
     heap: BinaryHeap<Reverse<(u32, u32)>>,
 }
 
 impl<'t> LowerBound<'t> {
-    fn new(tt: &'t Timetable, targets: &[(u32, u32)]) -> Self {
+    pub fn new(tt: &'t Timetable, targets: &[(u32, u32)]) -> Self {
+        let n = tt.meta.n_stops;
         let mut lb = Self {
             tt,
-            dist: FxMap::default(),
-            settled: FxMap::default(),
+            dist: Lazy::new(n),
+            settled: Lazy::new(n),
+            n_settled: 0,
             heap: BinaryHeap::new(),
         };
         for &(s, w) in targets {
-            if lb.dist.get(&s).is_none_or(|&d| w < d) {
-                lb.dist.insert(s, w);
+            if lb.dist.get(s).is_none_or(|d| w < d) {
+                lb.dist.set(s, w);
                 lb.heap.push(Reverse((w, s)));
             }
         }
@@ -139,7 +173,7 @@ impl<'t> LowerBound<'t> {
     /// True if `lb(s) ≥ need` (expands the search only up to `need`).
     fn at_least(&mut self, s: u32, need: u32) -> bool {
         loop {
-            if let Some(&d) = self.settled.get(&s) {
+            if let Some(d) = self.settled.get(s) {
                 return d >= need;
             }
             let Some(&Reverse((d, u))) = self.heap.peek() else {
@@ -149,10 +183,11 @@ impl<'t> LowerBound<'t> {
                 return true; // everything closer than `need` is settled
             }
             self.heap.pop();
-            if self.settled.contains_key(&u) {
+            if self.settled.get(u).is_some() {
                 continue;
             }
-            self.settled.insert(u, d);
+            self.settled.set(u, d);
+            self.n_settled += 1;
             let tt = self.tt;
             let (a, b) = (
                 tt.lb_in_off[u as usize] as usize,
@@ -160,8 +195,8 @@ impl<'t> LowerBound<'t> {
             );
             for (&v, &w) in tt.lb_in_from[a..b].iter().zip(&tt.lb_in_secs[a..b]) {
                 let nd = d.saturating_add(w);
-                if !self.settled.contains_key(&v) && self.dist.get(&v).is_none_or(|&x| nd < x) {
-                    self.dist.insert(v, nd);
+                if self.settled.get(v).is_none() && self.dist.get(v).is_none_or(|x| nd < x) {
+                    self.dist.set(v, nd);
                     self.heap.push(Reverse((nd, v)));
                 }
             }
@@ -169,22 +204,28 @@ impl<'t> LowerBound<'t> {
     }
 }
 
-struct Search<'t, 'q> {
+struct Search<'t, 'q, 'l> {
     tt: &'t Timetable,
     q: &'q Query<'q>,
     targets: FxMap<u32, u32>,
     ride: Vec<FxMap<u32, RideLabel>>,
     walk: Vec<FxMap<u32, WalkLabel>>,
-    best_ride: FxMap<u32, u32>,
-    best_ready: FxMap<u32, u32>,
-    lb: LowerBound<'t>,
+    best_ride: Lazy,
+    best_ready: Lazy,
+    lb: &'l mut LowerBound<'t>,
     bound: u32,
+    inserted: usize,
     /// Best target arrival per round: (arrival, target stop, label kind).
     best_target: Vec<Option<(u32, u32, From)>>,
     stats: SearchStats,
 }
 
-pub fn search(tt: &Timetable, q: &Query) -> (Vec<Journey>, SearchStats) {
+/// One RAPTOR search; `lb` must have been created for `q.targets`.
+pub fn search<'t>(
+    tt: &'t Timetable,
+    q: &Query,
+    lb: &mut LowerBound<'t>,
+) -> (Vec<Journey>, SearchStats) {
     let mut s = Search {
         tt,
         q,
@@ -195,9 +236,10 @@ pub fn search(tt: &Timetable, q: &Query) -> (Vec<Journey>, SearchStats) {
         }),
         ride: vec![FxMap::default()],
         walk: vec![FxMap::default()],
-        best_ride: FxMap::default(),
-        best_ready: FxMap::default(),
-        lb: LowerBound::new(tt, q.targets),
+        best_ride: Lazy::new(tt.meta.n_stops),
+        best_ready: Lazy::new(tt.meta.n_stops),
+        lb,
+        inserted: 0,
         bound: q.depart.saturating_add(q.window),
         best_target: vec![None],
         stats: SearchStats::default(),
@@ -215,11 +257,11 @@ pub fn search(tt: &Timetable, q: &Query) -> (Vec<Journey>, SearchStats) {
             }
         }
     }
-    s.stats.lb_settled = s.lb.settled.len();
+    s.stats.lb_settled = s.lb.n_settled;
     (out, s.stats)
 }
 
-impl Search<'_, '_> {
+impl Search<'_, '_, '_> {
     fn note_target(&mut self, k: usize, stop: u32, arr: u32, kind: From) {
         if let Some(&w) = self.targets.get(&stop) {
             let a = arr.saturating_add(w);
@@ -240,7 +282,7 @@ impl Search<'_, '_> {
         let mut marked: Vec<u32> = Vec::new();
         for &(s, w) in self.q.sources {
             let t = self.q.depart.saturating_add(w);
-            if self.best_ready.get(&s).is_none_or(|&b| t < b) && !self.pruned(s, t) {
+            if self.best_ready.get(s).is_none_or(|b| t < b) && !self.pruned(s, t) {
                 self.walk[0].insert(
                     s,
                     WalkLabel {
@@ -249,7 +291,7 @@ impl Search<'_, '_> {
                         secs: w,
                     },
                 );
-                self.best_ready.insert(s, t);
+                self.best_ready.set(s, t);
                 marked.push(s);
                 self.note_target(0, s, t, From::Walk);
             }
@@ -263,7 +305,7 @@ impl Search<'_, '_> {
             }
             for (u, secs) in tt.footpaths(s) {
                 let t = src.ready.saturating_add(secs);
-                if self.best_ready.get(&u).is_none_or(|&b| t < b) && !self.pruned(u, t) {
+                if self.best_ready.get(u).is_none_or(|b| t < b) && !self.pruned(u, t) {
                     self.walk[0].insert(
                         u,
                         WalkLabel {
@@ -272,14 +314,14 @@ impl Search<'_, '_> {
                             secs,
                         },
                     );
-                    self.best_ready.insert(u, t);
+                    self.best_ready.set(u, t);
                     marked.push(u);
                     self.note_target(0, u, t, From::Walk);
                 }
             }
         }
         for k in 1..=self.q.max_transfers + 1 {
-            if marked.is_empty() {
+            if marked.is_empty() || self.stats.truncated {
                 break;
             }
             self.stats.rounds = k;
@@ -304,6 +346,10 @@ impl Search<'_, '_> {
             let mut routes: Vec<(u32, u32)> = queue.into_iter().collect();
             routes.sort_unstable();
             for (r, p0) in routes {
+                if self.inserted > self.q.max_labels {
+                    self.stats.truncated = true;
+                    break;
+                }
                 self.stats.routes_scanned += 1;
                 self.scan_route(k, r, p0, &mut improved);
             }
@@ -318,14 +364,15 @@ impl Search<'_, '_> {
                 let ct = tt.stop_change[s as usize];
                 if ct != FORBIDDEN {
                     let ready = l.arr.saturating_add(ct);
-                    if self.best_ready.get(&s).is_none_or(|&b| ready < b) {
-                        self.best_ready.insert(s, ready);
+                    if self.best_ready.get(s).is_none_or(|b| ready < b) {
+                        self.best_ready.set(s, ready);
                         next.push(s);
                     }
                 }
                 for (u, secs) in tt.footpaths(s) {
                     let t = l.arr.saturating_add(secs);
-                    if self.best_ready.get(&u).is_none_or(|&b| t < b) && !self.pruned(u, t) {
+                    if self.best_ready.get(u).is_none_or(|b| t < b) && !self.pruned(u, t) {
+                        self.inserted += 1;
                         self.walk[k].insert(
                             u,
                             WalkLabel {
@@ -334,7 +381,7 @@ impl Search<'_, '_> {
                                 secs,
                             },
                         );
-                        self.best_ready.insert(u, t);
+                        self.best_ready.set(u, t);
                         next.push(u);
                         self.note_target(k, u, t, From::Walk);
                     }
@@ -384,8 +431,9 @@ impl Search<'_, '_> {
                 && flags & FLAG_NO_DROP_OFF == 0
             {
                 let a = base + tt.arrs(ru, pos)[j];
-                if self.best_ride.get(&s).is_none_or(|&b| a < b) && !self.pruned(s, a) {
-                    self.best_ride.insert(s, a);
+                if self.best_ride.get(s).is_none_or(|b| a < b) && !self.pruned(s, a) {
+                    self.best_ride.set(s, a);
+                    self.inserted += 1;
                     self.ride[k].insert(
                         s,
                         RideLabel {

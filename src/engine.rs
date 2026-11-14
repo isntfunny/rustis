@@ -17,7 +17,14 @@ const MAX_TRAVEL: u32 = 4 * 86_400;
 
 pub struct Snapshot {
     tt: Timetable,
+    /// Per-search label budget (see `raptor::Query::max_labels`).
+    max_labels: usize,
 }
+
+/// Default per-search label budget; bounds the memory and time of searches
+/// that would otherwise explore most of the network (e.g. targets without
+/// service on the requested day).
+pub const DEFAULT_MAX_LABELS: usize = 150_000;
 
 /// Builds a snapshot from several feeds into `dest` (staging dir + rename).
 pub fn build_snapshot(feeds: &[FeedSpec], dest: &Path, opts: BuildOptions) -> Result<SnapshotMeta> {
@@ -54,11 +61,16 @@ impl Snapshot {
     pub fn open(dir: &Path) -> Result<Self> {
         Ok(Self {
             tt: Timetable::open(dir)?,
+            max_labels: DEFAULT_MAX_LABELS,
         })
     }
 
     pub fn verify(&self) -> Result<()> {
         self.tt.verify()
+    }
+
+    pub fn set_max_labels(&mut self, n: usize) {
+        self.max_labels = n.max(1);
     }
 
     pub fn meta(&self) -> &SnapshotMeta {
@@ -147,7 +159,10 @@ impl Snapshot {
         let mut searches = 0;
         let mut stats = Vec::new();
         let mut first_dep: Option<u32> = None;
+        // Lower bounds depend only on the targets: shared by all searches.
+        let mut lb = raptor::LowerBound::new(&self.tt, &to.stops);
         let mut ok_window: Option<u32> = None;
+        let mut truncated = false;
         'outer: while found.len() < q.max_results && searches < 3 * q.max_results {
             // Iterative deepening: the first window with a result decides;
             // then one more search with slack collects Pareto alternatives
@@ -171,10 +186,12 @@ impl Snapshot {
                     depart,
                     max_transfers: q.max_transfers as usize,
                     window: w,
+                    max_labels: self.max_labels,
                 };
                 searches += 1;
-                let (js, st) = raptor::search(&self.tt, &query);
+                let (js, st) = raptor::search(&self.tt, &query, &mut lb);
                 stats.push(st);
+                truncated |= st.truncated;
                 if let Some(best) = js.iter().map(|j| j.arrival).min() {
                     let dur = best - depart;
                     let slack = (dur / 2).max(1800);
@@ -187,14 +204,19 @@ impl Snapshot {
                                 window: w2,
                                 ..query
                             },
+                            &mut lb,
                         )
                     } else {
                         (Vec::new(), Default::default())
                     };
                     stats.push(st2);
+                    truncated |= st2.truncated;
                     result = Some(if js2.is_empty() { js } else { js2 });
                     ok_window = Some(w2.max(w));
                     break;
+                }
+                if st.truncated {
+                    break; // a larger window would exceed the budget too
                 }
             }
             let Some(js) = result else { break 'outer };
@@ -253,6 +275,13 @@ impl Snapshot {
             eprintln!("timing: {:?} searches={searches} {:?}", t0.elapsed(), stats);
         }
         let mut warnings = self.warnings();
+        if truncated {
+            warnings.push(format!(
+                "SEARCH LIMIT: the search stopped after {} labels; journeys (or later/fewer-transfer \
+                 alternatives) may exist that were not explored.",
+                self.max_labels
+            ));
+        }
         if kept.iter().any(|i| i.booking_required) {
             warnings.push(
                 "BOOKING: itineraries marked booking_required use stops where boarding or alighting must be \
