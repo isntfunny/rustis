@@ -8,6 +8,7 @@ pub mod http;
 pub mod inventory;
 pub mod memory;
 mod model;
+pub mod motis;
 mod raptor;
 pub mod store;
 mod tt;

@@ -124,6 +124,8 @@ pub fn router_with(handle: Arc<SnapshotHandle>, max_concurrency: usize) -> Route
         .route("/v1/stats", get(stats))
         .route("/v1/stops", get(stops))
         .route("/v1/plan", post(plan))
+        .route("/api/v6/plan", get(motis_plan_get).post(motis_plan_post))
+        .route("/api/v6/map/stops", get(motis_stops))
         .layer(DefaultBodyLimit::max(64 * 1024))
         .with_state(state)
 }
@@ -249,6 +251,60 @@ async fn plan(State(s): State<AppState>, body: Bytes) -> Response {
     };
     match run_blocking(&s, move |snap| snap.plan(&req)).await {
         Ok(resp) => Json(resp).into_response(),
+        Err(r) => r,
+    }
+}
+
+type MotisQuery<T> = Result<Query<T>, axum::extract::rejection::QueryRejection>;
+
+async fn motis_plan_get(
+    State(s): State<AppState>,
+    q: MotisQuery<crate::motis::PlanQuery>,
+) -> Response {
+    motis_plan_run(s, q, Bytes::new()).await
+}
+
+async fn motis_plan_post(
+    State(s): State<AppState>,
+    q: MotisQuery<crate::motis::PlanQuery>,
+    body: Bytes,
+) -> Response {
+    motis_plan_run(s, q, body).await
+}
+
+async fn motis_plan_run(
+    s: AppState,
+    q: MotisQuery<crate::motis::PlanQuery>,
+    body: Bytes,
+) -> Response {
+    let Query(q) = match q {
+        Ok(q) => q,
+        Err(e) => return error(StatusCode::BAD_REQUEST, e.body_text()),
+    };
+    let body: crate::motis::PlanBody = if body.iter().all(u8::is_ascii_whitespace) {
+        Default::default()
+    } else {
+        match serde_json::from_slice(&body) {
+            Ok(b) => b,
+            Err(e) => return error(StatusCode::BAD_REQUEST, format!("invalid JSON body: {e}")),
+        }
+    };
+    match run_blocking(&s, move |snap| crate::motis::plan(snap, &q, &body)).await {
+        Ok(v) => Json(v).into_response(),
+        Err(r) => r,
+    }
+}
+
+async fn motis_stops(
+    State(s): State<AppState>,
+    q: MotisQuery<crate::motis::StopsQuery>,
+) -> Response {
+    let Query(q) = match q {
+        Ok(q) => q,
+        Err(e) => return error(StatusCode::BAD_REQUEST, e.body_text()),
+    };
+    match run_blocking(&s, move |snap| crate::motis::stops(snap, &q)).await {
+        Ok(v) => Json(v).into_response(),
         Err(r) => r,
     }
 }

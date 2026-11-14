@@ -34,7 +34,7 @@ pub const FLAG_DROP_OFF_BOOKING: u8 = 8;
 /// Change time value meaning "no transfer possible at this stop" (type 3).
 pub const FORBIDDEN: u32 = u32::MAX;
 pub const NONE: u32 = u32::MAX;
-pub const SNAPSHOT_VERSION: u32 = 5;
+pub const SNAPSHOT_VERSION: u32 = 6;
 /// Bit set in `foot_secs` for footpaths given explicitly by transfers.txt
 /// (the walk is not raised to the change time of the stop it starts at).
 pub const FOOT_EXPLICIT: u32 = 1 << 31;
@@ -43,7 +43,7 @@ pub const FOOT_EXPLICIT: u32 = 1 << 31;
 pub struct BuildOptions {
     /// First service day of the horizon (`YYYY-MM-DD`).
     pub first_day: jiff::civil::Date,
-    /// Number of service days from `first_day` (MOTIS on Mars: 365).
+    /// Number of service days from `first_day` (MOTIS: 365).
     pub horizon_days: u32,
     /// Generated footpaths between stops closer than this (cross-feed linking).
     pub link_radius_m: f64,
@@ -167,8 +167,10 @@ struct FeedData {
     stops: Vec<Stop>,
     stop_tz: Vec<u16>,
     change: Vec<(u32, u32)>,
-    route_infos: Vec<(String, String, u16)>,
+    route_infos: Vec<RouteInfo>,
     gtfs_trip_ids: Vec<String>,
+    /// `trip_headsign` per GTFS trip (parallel to `gtfs_trip_ids`; empty = none).
+    gtfs_trip_headsigns: Vec<String>,
     patterns: Vec<Pattern>,
     footpaths: Vec<(u32, u32, u32)>,
     forbidden: Vec<(u32, u32)>,
@@ -177,6 +179,17 @@ struct FeedData {
     tz_names: Vec<String>,
     bitfield_table: Vec<u64>,
     max_time: u32,
+}
+
+/// Display attributes of one GTFS route (or NeTEx line).
+pub(crate) struct RouteInfo {
+    pub id: String,
+    pub line: String,
+    pub route_type: u16,
+    /// `route_color` as given (hex without `#`), empty if none.
+    pub color: String,
+    /// Name of the operating agency, empty if unknown.
+    pub agency: String,
 }
 
 /// A parsed, validated feed (feed-local indices) ready to be committed.
@@ -216,8 +229,14 @@ pub struct Builder {
     route_info_id: StrWriter,
     route_info_line: StrWriter,
     route_info_type: Vec<u16>,
+    route_info_color: StrWriter,
+    route_info_agency: StrWriter,
     gtfs_trip_id: StrWriter,
     n_gtfs_trips: u32,
+    /// Per GTFS trip: index into `headsigns` (deduplicated strings; 0 = none).
+    gtfs_trip_headsign: ArrayWriter<u32>,
+    headsigns: StrWriter,
+    headsign_idx: HashMap<String, u32>,
     route_stop_off: Vec<u64>,
     route_stops: Vec<u32>,
     route_flags: Vec<u8>,
@@ -317,8 +336,17 @@ impl Builder {
             route_info_id: StrWriter::create(dir, "route_info_id")?,
             route_info_line: StrWriter::create(dir, "route_info_line")?,
             route_info_type: Vec::new(),
+            route_info_color: StrWriter::create(dir, "route_info_color")?,
+            route_info_agency: StrWriter::create(dir, "route_info_agency")?,
             gtfs_trip_id: StrWriter::create(dir, "gtfs_trip_id")?,
             n_gtfs_trips: 0,
+            gtfs_trip_headsign: ArrayWriter::create(dir, "gtfs_trip_headsign")?,
+            headsigns: {
+                let mut w = StrWriter::create(dir, "headsigns")?;
+                w.push("")?;
+                w
+            },
+            headsign_idx: HashMap::new(),
             route_stop_off: vec![0],
             route_stops: Vec::new(),
             route_flags: Vec::new(),
@@ -468,7 +496,12 @@ impl Parser<'_> {
 
         // agency.txt: one time zone per feed (GTFS requires all agencies to agree).
         let mut tz_name = None::<String>;
+        let mut agencies: HashMap<Box<[u8]>, String> = HashMap::new();
+        let mut first_agency = None::<String>;
         feed.rows("agency.txt", |c, r| {
+            let agency_name = text(r, c.get("agency_name"));
+            first_agency.get_or_insert_with(|| agency_name.clone());
+            agencies.insert(field(r, c.get("agency_id")).into(), agency_name);
             let t = text(r, c.get("agency_timezone"));
             match &tz_name {
                 None if !t.is_empty() => tz_name = Some(t),
@@ -561,7 +594,18 @@ impl Parser<'_> {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(u16::MAX);
             route_idx.insert(id.into(), info_base + route_infos.len() as u32);
-            route_infos.push((ns(name, &String::from_utf8_lossy(id)), line, rt));
+            let agency = agencies
+                .get(field(r, c.get("agency_id")))
+                .or(first_agency.as_ref())
+                .cloned()
+                .unwrap_or_default();
+            route_infos.push(RouteInfo {
+                id: ns(name, &String::from_utf8_lossy(id)),
+                line,
+                route_type: rt,
+                color: text(r, c.get("route_color")),
+                agency,
+            });
             Ok(())
         })?;
 
@@ -649,6 +693,7 @@ impl Parser<'_> {
         }
         let gtfs_base = 0u32;
         let mut gtfs_trip_ids = Vec::new();
+        let mut gtfs_trip_headsigns = Vec::new();
         let mut trips: HashMap<Box<[u8]>, TripMeta> = HashMap::new();
         feed.rows("trips.txt", |c, r| {
             let id = field(r, c.get("trip_id"));
@@ -676,6 +721,7 @@ impl Parser<'_> {
                 bail!("duplicate trip_id {:?}", String::from_utf8_lossy(id));
             }
             gtfs_trip_ids.push(ns(name, &String::from_utf8_lossy(id)));
+            gtfs_trip_headsigns.push(text(r, c.get("trip_headsign")));
             Ok(())
         })?;
         report.gtfs_trips = gtfs_trip_ids.len() as u64;
@@ -1103,6 +1149,7 @@ impl Parser<'_> {
             change,
             route_infos,
             gtfs_trip_ids,
+            gtfs_trip_headsigns,
             patterns,
             footpaths,
             forbidden,
@@ -1169,13 +1216,28 @@ impl Builder {
         for (s, secs) in explicit {
             self.change[s as usize] = secs;
         }
-        for (id, line, rt) in d.route_infos {
-            self.route_info_id.push(&id)?;
-            self.route_info_line.push(&line)?;
-            self.route_info_type.push(rt);
+        for ri in d.route_infos {
+            self.route_info_id.push(&ri.id)?;
+            self.route_info_line.push(&ri.line)?;
+            self.route_info_type.push(ri.route_type);
+            self.route_info_color.push(&ri.color)?;
+            self.route_info_agency.push(&ri.agency)?;
         }
         for id in &d.gtfs_trip_ids {
             self.gtfs_trip_id.push(id)?;
+        }
+        for h in d.gtfs_trip_headsigns {
+            let i = if h.is_empty() {
+                0
+            } else if let Some(&i) = self.headsign_idx.get(&h) {
+                i
+            } else {
+                let i = self.headsign_idx.len() as u32 + 1;
+                self.headsigns.push(&h)?;
+                self.headsign_idx.insert(h, i);
+                i
+            };
+            self.gtfs_trip_headsign.push(i)?;
         }
         self.n_gtfs_trips += d.gtfs_trip_ids.len() as u32;
         let mut routes = 0u64;
@@ -1518,7 +1580,11 @@ impl Builder {
         self.arr.finish(m)?;
         self.route_info_id.finish(m)?;
         self.route_info_line.finish(m)?;
+        self.route_info_color.finish(m)?;
+        self.route_info_agency.finish(m)?;
         self.gtfs_trip_id.finish(m)?;
+        self.gtfs_trip_headsign.finish(m)?;
+        self.headsigns.finish(m)?;
         let cat_bytes = catalog::write(&self.stops, &dir.join("catalog.bin"))?;
         let _ = cat_bytes;
 

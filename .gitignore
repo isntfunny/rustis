@@ -3,3 +3,8 @@
 /data/
 *.tmp
 __pycache__/
+
+# internal (planning lives in the wiki, helper scripts stay local)
+/docs/
+/scripts/
+/GAMEPLAN.md

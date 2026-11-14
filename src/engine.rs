@@ -494,6 +494,11 @@ impl Snapshot {
             route_id: None,
             line: None,
             mode: None,
+            route_type: None,
+            headsign: None,
+            agency: None,
+            color: None,
+            intermediate_stops: Vec::new(),
             pickup_booking_required: false,
             drop_off_booking_required: false,
             geometry,
@@ -588,6 +593,9 @@ impl Snapshot {
                         tt.route_stop(r, board_pos as usize),
                         tt.route_stop(r, alight_pos as usize),
                     );
+                    let intermediate: Vec<Stop> = (board_pos + 1..alight_pos)
+                        .map(|p| self.stop(tt.route_stop(r, p as usize)))
+                        .collect();
                     let geometry = (board_pos..=alight_pos)
                         .filter_map(|p| coord(tt.route_stop(r, p as usize)))
                         .collect();
@@ -602,6 +610,19 @@ impl Snapshot {
                     leg.route_id = Some(tt.route_info_id.get(info).to_owned());
                     leg.line = Some(tt.route_info_line.get(info).to_owned());
                     leg.mode = Some(build::mode_name(tt.route_info_type[info]).to_owned());
+                    leg.route_type = Some(tt.route_info_type[info]);
+                    leg.intermediate_stops = intermediate;
+                    let gtfs = tt.trip_gtfs[trip as usize] as usize;
+                    let h = tt.gtfs_trip_headsign[gtfs] as usize;
+                    leg.headsign = Some(if h != 0 {
+                        tt.headsigns.get(h).to_owned()
+                    } else {
+                        let last = tt.route_stop_off[r + 1] - tt.route_stop_off[r] - 1;
+                        self.stop(tt.route_stop(r, last as usize)).name
+                    });
+                    let nonempty = |v: &str| (!v.is_empty()).then(|| v.to_owned());
+                    leg.agency = nonempty(tt.route_info_agency.get(info));
+                    leg.color = nonempty(tt.route_info_color.get(info));
                     leg.pickup_booking_required =
                         tt.route_flag(r, board_pos as usize) & FLAG_PICKUP_BOOKING != 0;
                     leg.drop_off_booking_required =
@@ -767,6 +788,17 @@ impl Snapshot {
     }
 
     /// Snapshot directory.
+    /// IANA time zone of a stop (catalogue id), `None` if unknown.
+    pub fn stop_timezone(&self, id: &str) -> Option<&str> {
+        let i = self.tt.catalog.lookup(id)?;
+        Some(&self.tt.meta.timezones[self.tt.stop_tz[i] as usize])
+    }
+
+    /// Walking speed and link radius the snapshot was built with.
+    pub fn walk_speed(&self) -> f64 {
+        self.tt.meta.walk_speed_m_per_s
+    }
+
     pub fn dir(&self) -> &Path {
         &self.tt.dir
     }

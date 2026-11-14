@@ -68,7 +68,11 @@ pub struct Timetable {
     pub arr: Array<u32>,
     pub route_info_id: Strs,
     pub route_info_line: Strs,
+    pub route_info_color: Strs,
+    pub route_info_agency: Strs,
     pub gtfs_trip_id: Strs,
+    pub gtfs_trip_headsign: Array<u32>,
+    pub headsigns: Strs,
     /// Unix seconds that relative time 0 corresponds to.
     pub origin: i64,
     /// `base[tz][day]`: relative time of "noon − 12 h" of service day `day`
@@ -161,7 +165,11 @@ impl Timetable {
             arr: a!("arr"),
             route_info_id: Strs::open(dir, "route_info_id", m)?,
             route_info_line: Strs::open(dir, "route_info_line", m)?,
+            route_info_color: Strs::open(dir, "route_info_color", m)?,
+            route_info_agency: Strs::open(dir, "route_info_agency", m)?,
             gtfs_trip_id: Strs::open(dir, "gtfs_trip_id", m)?,
+            gtfs_trip_headsign: a!("gtfs_trip_headsign"),
+            headsigns: Strs::open(dir, "headsigns", m)?,
             origin,
             base,
             tzs,

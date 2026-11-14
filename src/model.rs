@@ -126,6 +126,17 @@ pub struct Leg {
     pub route_id: Option<String>,
     pub line: Option<String>,
     pub mode: Option<String>,
+    /// GTFS `route_type` (extended types kept).
+    pub route_type: Option<u16>,
+    /// `trip_headsign`, else the name of the trip's last stop.
+    pub headsign: Option<String>,
+    /// Operating agency name.
+    pub agency: Option<String>,
+    /// `route_color` (hex without `#`).
+    pub color: Option<String>,
+    /// Stops passed between boarding and alighting (transit legs).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub intermediate_stops: Vec<Stop>,
     /// Boarding needs a phone booking / driver arrangement (pickup_type 2/3).
     pub pickup_booking_required: bool,
     /// Alighting needs a phone booking / driver arrangement (drop_off_type 2/3).
