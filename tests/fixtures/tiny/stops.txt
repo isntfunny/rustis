@@ -1,0 +1,5 @@
+stop_id,stop_name,stop_lat,stop_lon
+A,Origin,50.000,8.000
+B,Interchange west,50.010,8.010
+C,Destination,50.020,8.020
+D,Interchange east,50.011,8.011

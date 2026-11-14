@@ -1,0 +1,6 @@
+route_id,agency_id,route_short_name,route_long_name,route_type
+R1,test,1,First bus,3
+R2,test,2,Connecting bus,3
+RS,test,S,Direct slow,3
+RN,test,N,Night bus,3
+RP,test,P,Restricted express,3

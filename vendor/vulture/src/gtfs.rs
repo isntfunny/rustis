@@ -1,0 +1,2368 @@
+//! [`Timetable`] implementation backed by a GTFS feed.
+//!
+//! Wraps a parsed [`Gtfs`] object and pre-computes lookup indices for
+//! efficient route, stop, and trip queries.
+//!
+//! ## Loading sources
+//!
+//! The `Gtfs` value [`GtfsTimetable::new`] consumes can come from a local
+//! path ([`Gtfs::new`]) or from any of the alternatives `gtfs-structures`
+//! already exposes: `Gtfs::from_url` (sync HTTP fetch), `Gtfs::from_url_async`
+//! (async), and `Gtfs::from_reader` for any `Read + Seek`.
+//!
+//! ## Synthetic routes
+//!
+//! A "RAPTOR route" is an equivalence class of trips with identical stop
+//! sequences (the paper, §3.1). A GTFS `route_id` is *not* a RAPTOR route
+//! – it routinely groups trips with different stop patterns
+//! (short-turns, branching, deadheads). At construction time, this
+//! adapter splits each `route_id` into one or more synthetic routes,
+//! identified by [`RouteIdx`]. Trips on a synthetic route are
+//! additionally split into non-overtaking sub-groups so that the
+//! algorithm's binary-search-by-departure assumption holds.
+//!
+//! Use [`GtfsTimetable::route_id`] to recover the original GTFS
+//! `route_id` for display, and [`GtfsTimetable::routes_for_gtfs_id`] to
+//! enumerate every synthetic derived from a given GTFS route.
+//!
+//! ## Visualisation
+//!
+//! [`GtfsTimetable::shape_for_leg`] returns the polyline segment of one
+//! journey leg's shape, sliced between board and alight stops. Uses
+//! `shape_dist_traveled` for exact slicing when present and projects
+//! each stop onto the polyline as a fallback. Primarily for FFI
+//! consumers visualising journeys on a map; the in-tree `vulture-wasm`
+//! crate uses it to bake per-leg `shape` data into the JS objects
+//! returned by `runArrival` / `runRange`.
+
+use std::collections::{HashMap, HashSet};
+
+use chrono::{Datelike, NaiveDate, Weekday};
+use gtfs_structures::{Availability, Exception, Gtfs, PickupDropOffType};
+use jiff::civil::Date;
+use rstar::{AABB, PointDistance, RTree, RTreeObject};
+use smallvec::SmallVec;
+
+use crate::{Duration, RouteIdx, SecondOfDay, StopIdx, Timetable, TripIdx};
+
+/// Mean Earth radius in metres, used to project stop coordinates to a
+/// local Cartesian frame for the `with_walking_footpaths` spatial query.
+const EARTH_RADIUS_M: f64 = 6_371_000.0;
+
+/// A stop projected to local Cartesian coordinates (metres) via an
+/// equirectangular projection anchored at a reference latitude. Used as
+/// the leaf type of the R-tree built by `with_walking_footpaths`.
+#[derive(Clone, Copy, Debug)]
+struct ProjectedStop {
+    pos: [f64; 2],
+    idx: StopIdx,
+}
+
+impl RTreeObject for ProjectedStop {
+    type Envelope = AABB<[f64; 2]>;
+    fn envelope(&self) -> Self::Envelope {
+        AABB::from_point(self.pos)
+    }
+}
+
+impl PointDistance for ProjectedStop {
+    fn distance_2(&self, point: &[f64; 2]) -> f64 {
+        let dx = self.pos[0] - point[0];
+        let dy = self.pos[1] - point[1];
+        dx * dx + dy * dy
+    }
+}
+
+/// Returns true iff `service_id` is active on `date` per the GTFS feed's
+/// `calendar.txt` and `calendar_dates.txt` rules.
+///
+/// Resolution order: an entry in `calendar_dates.txt` for the exact
+/// date trumps `calendar.txt`. If `calendar_dates.txt` has no entry,
+/// `calendar.txt` decides via the day-of-week flags constrained by
+/// the service's `start_date`/`end_date` window. A service that
+/// appears in neither file is considered inactive.
+fn is_service_active(gtfs: &Gtfs, service_id: &str, date: NaiveDate) -> bool {
+    if let Some(cdates) = gtfs.calendar_dates.get(service_id)
+        && let Some(cd) = cdates.iter().find(|cd| cd.date == date)
+    {
+        return matches!(cd.exception_type, Exception::Added);
+    }
+    if let Some(cal) = gtfs.calendar.get(service_id) {
+        if date < cal.start_date || date > cal.end_date {
+            return false;
+        }
+        return match date.weekday() {
+            Weekday::Mon => cal.monday,
+            Weekday::Tue => cal.tuesday,
+            Weekday::Wed => cal.wednesday,
+            Weekday::Thu => cal.thursday,
+            Weekday::Fri => cal.friday,
+            Weekday::Sat => cal.saturday,
+            Weekday::Sun => cal.sunday,
+        };
+    }
+    false
+}
+
+/// Convert a `jiff::civil::Date` to `chrono::NaiveDate` at the GTFS
+/// boundary. `gtfs-structures` exposes calendar dates as `chrono`; the
+/// rest of this crate uses `jiff` so users only see one date type.
+fn jiff_to_chrono(d: Date) -> NaiveDate {
+    NaiveDate::from_ymd_opt(d.year() as i32, d.month() as u32, d.day() as u32)
+        .expect("jiff::civil::Date guarantees a valid (year, month, day) triple")
+}
+
+const TYPICAL_ROUTES_PER_STOP: usize = 8;
+const TYPICAL_TRANSFERS_PER_STOP: usize = 4;
+const DEFAULT_TRANSFER_TIME: Duration = Duration(300);
+
+/// Errors that can occur when constructing a [`GtfsTimetable`].
+///
+/// Every variant carries the offending trip's GTFS `route_id` (and the
+/// route's `agency_id` when one is set) so a feed-validation report can
+/// be filed against the right operator without further lookup.
+#[derive(thiserror::Error, Debug)]
+pub enum GtfsError {
+    /// A stop referenced by a trip was not found in the feed's
+    /// `stops.txt`.
+    #[error(
+        "stop {stop} (referenced by trip {trip} on route {route}, agency {}) not found",
+        agency.as_deref().unwrap_or("?"),
+    )]
+    MissingStop {
+        /// The unresolved stop ID.
+        stop: String,
+        /// The trip that referenced the stop.
+        trip: String,
+        /// The trip's GTFS `route_id`.
+        route: String,
+        /// The route's `agency_id`, when set.
+        agency: Option<String>,
+    },
+    /// A trip has no stop times defined.
+    #[error(
+        "trip {trip} on route {route} (agency {}) has no stop_times",
+        agency.as_deref().unwrap_or("?"),
+    )]
+    MissingStopTimes {
+        /// The trip with no stop_times.
+        trip: String,
+        /// The trip's GTFS `route_id`.
+        route: String,
+        /// The route's `agency_id`, when set.
+        agency: Option<String>,
+    },
+    /// A trip has a stop_time without a departure time, which the algorithm
+    /// needs for binary-search ordering.
+    #[error(
+        "stop_time has no departure_time: trip {trip} on route {route} (agency {}), stop {stop}",
+        agency.as_deref().unwrap_or("?"),
+    )]
+    MissingDepartureTime {
+        /// The trip the stop_time belongs to.
+        trip: String,
+        /// The trip's GTFS `route_id`.
+        route: String,
+        /// The route's `agency_id`, when set.
+        agency: Option<String>,
+        /// The stop the stop_time refers to.
+        stop: String,
+    },
+    /// `service_date + n_overnight_days` would push the loaded date
+    /// range past jiff's representable range. Only triggered by
+    /// absurd combinations near the year-9999 ceiling.
+    #[error(
+        "base_date + {days_added} days falls outside jiff's representable range (base = {base})"
+    )]
+    DateOutOfRange {
+        /// The base service date the multi-day load was anchored at.
+        base: Date,
+        /// The day offset that overflowed.
+        days_added: u32,
+    },
+}
+
+type GtfsResult<T> = std::result::Result<T, GtfsError>;
+
+/// Number of additional service days to load *after* the base
+/// service date. Newtype around `u8` so the multi-day constructor
+/// argument names itself at the call site:
+///
+/// ```no_run
+/// # use vulture::gtfs::{GtfsTimetable, OvernightDays};
+/// # use jiff::civil::date;
+/// # use gtfs_structures::Gtfs;
+/// # fn ex(gtfs: &Gtfs) -> Result<(), Box<dyn std::error::Error>> {
+/// let tt = GtfsTimetable::new_with_overnight_days(
+///     gtfs,
+///     date(2026, 5, 4),
+///     OvernightDays(1),
+/// )?;
+/// # Ok(()) }
+/// ```
+///
+/// `OvernightDays(0)` is equivalent to [`GtfsTimetable::new`] (the
+/// single-day constructor), so the multi-day constructor is rarely
+/// the right choice with a zero argument; reach for it explicitly
+/// when you need the next day's trips visible to the search.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct OvernightDays(pub u8);
+
+impl OvernightDays {
+    /// Inner `u8` accessor for adapter-side arithmetic.
+    pub fn get(self) -> u8 {
+        self.0
+    }
+}
+
+/// `transfers.txt` row counts grouped by GTFS `transfer_type`. The
+/// adapter creates a footpath for every type *except* `Impossible`
+/// (type 3), which is the publisher explicitly forbidding the
+/// transfer; the [`impossible`](Self::impossible) field records that
+/// publisher intent so callers can see what was filtered.
+///
+/// [`impossible`]: TransfersByType::impossible
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TransfersByType {
+    /// `transfer_type = 0`: recommended interchange.
+    pub recommended: usize,
+    /// `transfer_type = 1`: timed transfer (departing trip waits for
+    /// the arriving one).
+    pub timed: usize,
+    /// `transfer_type = 2`: minimum-time transfer; `min_transfer_time`
+    /// is honoured.
+    pub min_time: usize,
+    /// `transfer_type = 3`: impossible / forbidden. Filtered out at
+    /// construction.
+    pub impossible: usize,
+    /// `transfer_type = 4`: stay-on-board (in-seat continuation).
+    pub stay_on_board: usize,
+    /// `transfer_type = 5`: in-seat transfer not allowed; the rider
+    /// must alight and re-board another vehicle.
+    pub must_alight: usize,
+}
+
+impl TransfersByType {
+    /// Total `transfers.txt` rows across every type (including
+    /// `Impossible`). Returns 0 when the feed has no `transfers.txt`.
+    pub fn total(&self) -> usize {
+        self.recommended
+            + self.timed
+            + self.min_time
+            + self.impossible
+            + self.stay_on_board
+            + self.must_alight
+    }
+
+    /// Rows that produced a footpath in the loaded timetable
+    /// (everything except `Impossible`). This is what the algorithm
+    /// actually walks over from `transfers.txt` alone, before any
+    /// [`GtfsTimetable::with_walking_footpaths`] augmentation.
+    pub fn loaded(&self) -> usize {
+        self.total() - self.impossible
+    }
+}
+
+/// Snapshot of a loaded GTFS feed's features. Returned by
+/// [`GtfsTimetable::features`] so callers can introspect what's in a
+/// feed at a glance, without reaching back to the source [`Gtfs`].
+///
+/// Fields fall into two groups:
+///
+/// 1. **Input-derived counts** (everything except the last three
+///    fields) are computed once at construction and immutable.
+/// 2. **Mutable state** ([`walking_footpaths_added`],
+///    [`footpaths_closed`], [`n_footpaths`]) reflects the timetable's
+///    *current* state and changes if you call
+///    [`GtfsTimetable::with_walking_footpaths`] or
+///    [`GtfsTimetable::assert_footpaths_closed`] after construction.
+///
+/// For an advisory list of vulture knobs that may be worth turning
+/// given a feed's shape, see [`FeedFeatures::suggestions`].
+///
+/// [`walking_footpaths_added`]: FeedFeatures::walking_footpaths_added
+/// [`footpaths_closed`]: FeedFeatures::footpaths_closed
+/// [`n_footpaths`]: FeedFeatures::n_footpaths
+#[derive(Debug, Clone, Default)]
+pub struct FeedFeatures {
+    /// Stops in the timetable's [`StopIdx`] domain (i.e. interned at
+    /// construction; equals `Gtfs.stops.len()` for well-formed feeds).
+    pub n_stops: usize,
+    /// Stops with both `latitude` and `longitude` populated. Only
+    /// these participate in coordinate-derived features (R-tree
+    /// walking footpaths, leg-shape rendering).
+    pub n_stops_with_coords: usize,
+    /// Stops with `location_type = 1` (parent stations). Queries
+    /// rooted at a parent station yield zero journeys; use
+    /// [`GtfsTimetable::station_stops`] to fan out to platforms.
+    pub n_parent_stations: usize,
+    /// Stops the publisher flagged `wheelchair_boarding = NotAvailable`.
+    /// Filtered by `Query::require_wheelchair_accessible(true)`.
+    pub n_inaccessible_stops: usize,
+
+    /// Routes in the timetable's [`RouteIdx`] domain. Note that
+    /// vulture splits a single GTFS `route_id` into multiple
+    /// [`RouteIdx`]s when its trips have different stop patterns or
+    /// overtake one another, so this can exceed `Gtfs.routes.len()`.
+    pub n_routes: usize,
+    /// Trips kept by the construction date filter (i.e. active on
+    /// the requested service date or any of its overnight days).
+    pub n_trips: usize,
+    /// Trips the publisher flagged `wheelchair_accessible = NotAvailable`.
+    pub n_inaccessible_trips: usize,
+    /// Trips whose `shape_id` is populated and resolves to a shape
+    /// in the source feed. Calling [`GtfsTimetable::shape_for_leg`]
+    /// for a leg of one of these trips returns a polyline.
+    pub n_trips_with_shapes: usize,
+
+    /// `transfers.txt` row counts by `transfer_type`. Computed before
+    /// vulture filters `Impossible` entries out of the footpath graph.
+    pub transfers_by_type: TransfersByType,
+
+    /// Whether [`GtfsTimetable::with_walking_footpaths`] has been
+    /// applied to this timetable (changes during the timetable's
+    /// lifetime).
+    pub walking_footpaths_added: bool,
+    /// Whether the footpath relation is currently marked transitively
+    /// closed (i.e. the runtime takes the single-pass `O(E)` walk
+    /// relaxation).
+    pub footpaths_closed: bool,
+    /// Total directed footpath edges in the relation as it stands
+    /// now, summed across stops.
+    pub n_footpaths: usize,
+}
+
+impl FeedFeatures {
+    /// Heuristic list of vulture knobs that may be worth turning given
+    /// this feed's shape. Strings are advisory one-line pointers (e.g.
+    /// "your `transfers.txt` is empty, consider calling X"), not
+    /// instructions; calling none of them still gives correct results.
+    /// Cheap (a handful of comparisons over the snapshot's fields).
+    ///
+    /// Returns an empty `Vec` when none of the heuristics fire – e.g.
+    /// a publisher-curated feed with no parent stations, no shapes,
+    /// and no wheelchair flags.
+    pub fn suggestions(&self) -> Vec<&'static str> {
+        let mut out: Vec<&'static str> = Vec::new();
+
+        if !self.walking_footpaths_added
+            && self.transfers_by_type.loaded() == 0
+            && self.n_stops_with_coords > 0
+        {
+            out.push(
+                "transfers.txt is empty: call \
+                 GtfsTimetable::with_walking_footpaths(max_distance_m, walking_speed) \
+                 to add coordinate-derived walking edges between nearby stops.",
+            );
+        }
+
+        if !self.walking_footpaths_added
+            && self.transfers_by_type.loaded() > 0
+            && !self.footpaths_closed
+        {
+            out.push(
+                "transfers.txt is non-empty but the relation is not marked closed: \
+                 if your transfers.txt is publisher-curated and known to be \
+                 transitively closed, call GtfsTimetable::assert_footpaths_closed \
+                 for the single-pass O(E) footpath relaxation.",
+            );
+        }
+
+        if self.n_parent_stations > 0 {
+            out.push(
+                "feed has parent stations: queries rooted at a parent station \
+                 return zero journeys – expand via GtfsTimetable::station_stops(parent_id) \
+                 and pass the returned platforms as Query::from / Query::to endpoints.",
+            );
+        }
+
+        if self.n_trips_with_shapes > 0 {
+            out.push(
+                "feed has trip shapes: call GtfsTimetable::shape_for_leg(...) to get \
+                 a polyline along the actual route rather than a stop-to-stop \
+                 straight line.",
+            );
+        }
+
+        if self.n_inaccessible_trips + self.n_inaccessible_stops > 0 {
+            out.push(
+                "feed marks some trips or stops wheelchair-inaccessible: pass \
+                 Query::require_wheelchair_accessible(true) to filter them out \
+                 of the search.",
+            );
+        }
+
+        out
+    }
+}
+
+/// A [`Timetable`] implementation that wraps a parsed GTFS feed.
+///
+/// Constructed via [`GtfsTimetable::new`], which validates the feed,
+/// interns stops/routes/trips to dense `u32` indices, splits each GTFS
+/// `route_id` into one or more [`RouteIdx`]s by stop pattern and
+/// overtaking, and builds the lookup indices the algorithm requires.
+///
+/// ```no_run
+/// use gtfs_structures::Gtfs;
+/// use jiff::civil::date;
+/// use vulture::{SecondOfDay, Timetable};
+/// use vulture::gtfs::GtfsTimetable;
+///
+/// # fn ex() -> anyhow::Result<()> {
+/// let gtfs = Gtfs::new("path/to/gtfs.zip")?;
+/// let tt = GtfsTimetable::new(&gtfs, date(2026, 5, 4))?;
+///
+/// let start = tt.stop_idx("origin_id").expect("unknown stop");
+/// let target = tt.stop_idx("target_id").expect("unknown stop");
+///
+/// let journeys = tt
+///     .query()
+///     .from(start)
+///     .to(target)
+///     .max_transfers(10)
+///     .depart_at(SecondOfDay::hms(9, 0, 0))
+///     .run();
+/// # Ok(())
+/// # }
+/// ```
+///
+/// Common follow-on calls:
+///
+/// - [`GtfsTimetable::station_stops`] – expand a parent station to its
+///   child platforms for multi-source / multi-target queries.
+/// - [`GtfsTimetable::with_walking_footpaths`] – augment a sparse or
+///   empty `transfers.txt` with coordinate-derived walking edges.
+/// - [`GtfsTimetable::assert_footpaths_closed`] – opt into the
+///   single-pass footpath relaxation when your `transfers.txt` is the
+///   entire intended walking relation.
+/// - [`GtfsTimetable::stop_id`] / [`GtfsTimetable::route_id`] – translate
+///   `StopIdx` / `RouteIdx` values back to the original GTFS IDs.
+/// - [`GtfsTimetable::routes_for_gtfs_id`] – enumerate the synthetic
+///   [`RouteIdx`]s produced from a single GTFS `route_id` (one per
+///   distinct, non-overtaking stop-pattern equivalence class).
+/// - [`GtfsTimetable::features`] – snapshot of the loaded feed's
+///   shape (counts, transfer-type breakdown, footpath state); paired
+///   with [`FeedFeatures::suggestions`] for an advisory list of
+///   vulture knobs worth turning given the snapshot.
+pub struct GtfsTimetable {
+    // Forward tables: idx -> owned String (original GTFS IDs cloned at
+    // construction so the timetable doesn't borrow from the source
+    // `Gtfs` — callers can drop the parsed feed after building).
+    stop_ids: Vec<String>,
+    route_ids: Vec<String>,
+    trip_ids: Vec<String>,
+
+    // Reverse tables.
+    stop_by_id: HashMap<String, StopIdx>,
+    route_by_id: HashMap<String, RouteIdx>,
+    routes_by_gtfs_id: HashMap<String, SmallVec<[RouteIdx; 2]>>,
+    trip_by_id: HashMap<String, TripIdx>,
+
+    // For each stop, the routes serving it paired with the *earliest*
+    // position of the stop on that route. Each route appears at most once
+    // per stop (loop routes that revisit the stop only get their earliest
+    // position recorded).
+    routes_for_stop: Vec<SmallVec<[(RouteIdx, u32); TYPICAL_ROUTES_PER_STOP]>>,
+    stops_for_route: Vec<Vec<StopIdx>>,
+    trips_for_route: Vec<Vec<TripIdx>>,
+    /// arrival_times[route.idx()][stop_pos][trip_pos] = SecondOfDay
+    arrival_times: Vec<Vec<Vec<SecondOfDay>>>,
+    /// departure_times[route.idx()][stop_pos][trip_pos] = SecondOfDay
+    departure_times: Vec<Vec<Vec<SecondOfDay>>>,
+    /// route_for_trip[trip.idx()] = (route_idx, position-within-route)
+    route_for_trip: Vec<(RouteIdx, usize)>,
+
+    footpaths_for_stops: Vec<SmallVec<[StopIdx; TYPICAL_TRANSFERS_PER_STOP]>>,
+    transfer_times: HashMap<(StopIdx, StopIdx), Duration>,
+
+    /// `(trip, pos)` pairs where boarding is forbidden by GTFS
+    /// `pickup_type = 1` (NotAvailable). Empty for typical metro feeds
+    /// where every stop is regularly boardable.
+    no_pickup: HashSet<(TripIdx, u32)>,
+    /// `(trip, pos)` pairs where alighting is forbidden by GTFS
+    /// `drop_off_type = 1` (NotAvailable). Same shape as `no_pickup`.
+    no_drop_off: HashSet<(TripIdx, u32)>,
+
+    /// Trips with `wheelchair_accessible = NotAvailable`. Sparse —
+    /// most feeds either populate the flag rarely or not at all.
+    inaccessible_trips: HashSet<TripIdx>,
+    /// Stops with `wheelchair_boarding = NotAvailable`. Same shape.
+    inaccessible_stops: HashSet<StopIdx>,
+
+    /// Closure flag returned from
+    /// [`Timetable::footpaths_are_transitively_closed`] so the algorithm
+    /// can pick the single-pass relaxation. Set via
+    /// [`GtfsTimetable::assert_footpaths_closed`] (publisher-curated
+    /// closed `transfers.txt`) or [`GtfsTimetable::with_walking_footpaths`]
+    /// (R-tree-derived edges with a per-leg distance cap, where chaining
+    /// would violate the cap and is therefore disallowed).
+    transfers_closed: bool,
+
+    /// For each parent-station GTFS id, the child platform `StopIdx`es
+    /// (each paired with a default zero walk time, ready to pass to
+    /// `Query::from` / `Query::to` as a multi-source/multi-target query).
+    station_children: HashMap<String, Vec<(StopIdx, Duration)>>,
+
+    // Feed-features bookkeeping, surfaced via [`GtfsTimetable::features`].
+    // Counts are computed once at construction; the
+    // `walking_footpaths_added` flag flips in [`with_walking_footpaths`].
+    n_stops_with_coords: usize,
+    n_parent_stations: usize,
+    n_trips_with_shapes: usize,
+    transfers_by_type: TransfersByType,
+    walking_footpaths_added: bool,
+}
+
+impl GtfsTimetable {
+    /// Rustis export hook: retain every prepared trip, including tied departures.
+    pub fn trips_on_route(&self, route: RouteIdx) -> &[TripIdx] {
+        &self.trips_for_route[route.idx()]
+    }
+
+    /// Creates a single-day timetable from a parsed GTFS feed for a
+    /// specific service date.
+    ///
+    /// Trips whose `service_id` is not active on `service_date` (per
+    /// `calendar.txt` and `calendar_dates.txt`) are filtered out at
+    /// construction.
+    ///
+    /// Validates that every trip references existing stops and has
+    /// stop_times with departure times, then interns identifiers to dense
+    /// `u32` indices and splits each GTFS `route_id` into synthetic
+    /// [`RouteIdx`]s as described in the module docs.
+    ///
+    /// For multi-day search ("last train home", overnight queries) use
+    /// [`new_with_overnight_days`](Self::new_with_overnight_days).
+    ///
+    /// # Footpath assumptions
+    ///
+    /// The adapter passes `transfers.txt` entries through to the
+    /// [`Timetable::get_footpaths_from`] return as-is, without computing
+    /// the transitive closure. The [`Timetable`] trait requires the
+    /// footpath relation to be transitively closed (see the trait-level
+    /// docs).
+    pub fn new(gtfs: &Gtfs, service_date: Date) -> GtfsResult<Self> {
+        Self::build(gtfs, service_date, 0)
+    }
+
+    /// Creates a multi-day timetable, extending the base service date
+    /// by [`OvernightDays`] additional days. The algorithm sees a
+    /// single time axis monotone across `0..=days × 86_400` seconds —
+    /// trips active on each subsequent day get their stop_times
+    /// shifted by `day_offset × 86_400` and inserted as additional
+    /// trips on the same RAPTOR route as their day-0 counterparts.
+    ///
+    /// Use this when a late-night query needs to find trips the next
+    /// morning. The typical "last train home" load is
+    /// `OvernightDays(1)`; larger values are unusual and scale memory
+    /// and load time linearly.
+    ///
+    /// Returned arrival times can exceed 86 400 seconds.
+    /// [`SecondOfDay`]'s `Display` impl formats them as `HH:MM:SS`
+    /// with hours past 24 (e.g. `25:30:00`); divide by 86 400 to
+    /// recover the day offset. [`Journey::with_timing`](crate::Journey::with_timing)'s
+    /// [`TimedLeg`](crate::TimedLeg) entries carry the same shifted
+    /// times.
+    ///
+    /// Returns [`GtfsError::DateOutOfRange`] if `service_date + days`
+    /// falls past jiff's representable range (only triggers near the
+    /// year-9999 ceiling).
+    pub fn new_with_overnight_days(
+        gtfs: &Gtfs,
+        service_date: Date,
+        days: OvernightDays,
+    ) -> GtfsResult<Self> {
+        Self::build(gtfs, service_date, days.get())
+    }
+
+    fn build(gtfs: &Gtfs, base_date: Date, n_overnight_days: u8) -> GtfsResult<Self> {
+        // Build a small lookup of day_offset -> NaiveDate so the
+        // service-day check is one cheap call per (trip, day) pair.
+        let mut day_dates: Vec<NaiveDate> = Vec::with_capacity(usize::from(n_overnight_days) + 1);
+        for d in 0..=n_overnight_days {
+            let day = base_date
+                .checked_add(jiff::Span::new().days(i64::from(d)))
+                .map_err(|_| GtfsError::DateOutOfRange {
+                    base: base_date,
+                    days_added: u32::from(d),
+                })?;
+            day_dates.push(jiff_to_chrono(day));
+        }
+
+        // 1. Intern stops in iteration order.
+        let mut stop_ids: Vec<String> = Vec::with_capacity(gtfs.stops.len());
+        let mut stop_by_id: HashMap<String, StopIdx> = HashMap::with_capacity(gtfs.stops.len());
+        let mut inaccessible_stops: HashSet<StopIdx> = HashSet::new();
+        let mut n_stops_with_coords: usize = 0;
+        let mut n_parent_stations: usize = 0;
+        for (stop_id, stop) in &gtfs.stops {
+            let idx = StopIdx::new(stop_ids.len() as u32);
+            stop_ids.push(stop_id.clone());
+            stop_by_id.insert(stop_id.clone(), idx);
+            if matches!(stop.wheelchair_boarding, Availability::NotAvailable) {
+                inaccessible_stops.insert(idx);
+            }
+            if stop.latitude.is_some() && stop.longitude.is_some() {
+                n_stops_with_coords += 1;
+            }
+            if matches!(stop.location_type, gtfs_structures::LocationType::StopArea) {
+                n_parent_stations += 1;
+            }
+        }
+
+        // 2. For each service day in the loaded range, validate trips
+        //    active on that day and group by (route_id, stop_sequence).
+        //    A trip active on multiple days gets multiple entries in
+        //    its group, distinguished by `day_offset`. Phase 3 shifts
+        //    each entry's times by `day_offset × 86400` so day-d trips
+        //    sit strictly after all day-(d-1) trips on the same route.
+        type GroupKey<'g> = (&'g str, Vec<StopIdx>);
+        type GroupEntries<'g> = Vec<(&'g str, u8)>;
+        let mut groups: std::collections::BTreeMap<GroupKey<'_>, GroupEntries<'_>> =
+            std::collections::BTreeMap::new();
+        for (day_offset, &day_chrono) in day_dates.iter().enumerate() {
+            let day_offset = day_offset as u8;
+            for (trip_id, trip) in &gtfs.trips {
+                if !is_service_active(gtfs, &trip.service_id, day_chrono) {
+                    continue;
+                }
+                // Lift route + agency once per trip so the per-stop
+                // error paths don't re-look-up under every stop_time.
+                let route_id = trip.route_id.clone();
+                let agency_id = gtfs
+                    .routes
+                    .get(&trip.route_id)
+                    .and_then(|r| r.agency_id.clone());
+                if trip.stop_times.is_empty() {
+                    return Err(GtfsError::MissingStopTimes {
+                        trip: trip_id.clone(),
+                        route: route_id,
+                        agency: agency_id,
+                    });
+                }
+                let mut stop_seq: Vec<StopIdx> = Vec::with_capacity(trip.stop_times.len());
+                for st in &trip.stop_times {
+                    let raw_id = st.stop.id.as_str();
+                    let stop_idx =
+                        *stop_by_id
+                            .get(raw_id)
+                            .ok_or_else(|| GtfsError::MissingStop {
+                                stop: raw_id.to_owned(),
+                                trip: trip_id.clone(),
+                                route: route_id.clone(),
+                                agency: agency_id.clone(),
+                            })?;
+                    if st.departure_time.is_none() {
+                        return Err(GtfsError::MissingDepartureTime {
+                            trip: trip_id.clone(),
+                            route: route_id.clone(),
+                            agency: agency_id.clone(),
+                            stop: raw_id.to_owned(),
+                        });
+                    }
+                    stop_seq.push(stop_idx);
+                }
+                groups
+                    .entry((trip.route_id.as_str(), stop_seq))
+                    .or_default()
+                    .push((trip_id.as_str(), day_offset));
+            }
+        }
+
+        // 3. For each (route_id, stop_seq) group, sort trips by first-stop
+        //    departure and split into non-overtaking sub-groups. Each
+        //    sub-group becomes a synthetic RouteIdx; trips become TripIdxs
+        //    in synthetic-route order.
+        let mut route_ids: Vec<String> = Vec::new();
+        let mut stops_for_route: Vec<Vec<StopIdx>> = Vec::new();
+        let mut trips_for_route: Vec<Vec<TripIdx>> = Vec::new();
+        let mut arrival_times: Vec<Vec<Vec<SecondOfDay>>> = Vec::new();
+        let mut departure_times: Vec<Vec<Vec<SecondOfDay>>> = Vec::new();
+        let mut route_for_trip: Vec<(RouteIdx, usize)> = Vec::with_capacity(gtfs.trips.len());
+        let mut no_pickup: HashSet<(TripIdx, u32)> = HashSet::new();
+        let mut no_drop_off: HashSet<(TripIdx, u32)> = HashSet::new();
+        let mut inaccessible_trips: HashSet<TripIdx> = HashSet::new();
+        let mut trip_ids: Vec<String> = Vec::new();
+        let mut trip_by_id: HashMap<String, TripIdx> = HashMap::new();
+        let mut route_by_id: HashMap<String, RouteIdx> = HashMap::new();
+        let mut routes_by_gtfs_id: HashMap<String, SmallVec<[RouteIdx; 2]>> = HashMap::new();
+        let mut routes_for_stop: Vec<SmallVec<[(RouteIdx, u32); TYPICAL_ROUTES_PER_STOP]>> =
+            vec![SmallVec::new(); stop_ids.len()];
+
+        for ((gtfs_route_id, stop_seq), trips) in groups {
+            // Resolve schedules and tag each entry with its day_offset.
+            // Sort first by shifted first-stop departure (= day_offset *
+            // 86400 + raw departure) so day-d trips appear strictly after
+            // day-(d-1) trips on the same route.
+            let mut trips_with_schedules: Vec<(&str, u8, &[gtfs_structures::StopTime])> =
+                trips
+                    .into_iter()
+                    .map(|(trip_id, day_offset)| {
+                        let trip = gtfs.get_trip(trip_id).expect(
+                            "trip_id is a key in gtfs.trips (groups was built by iterating gtfs.trips earlier in new())",
+                        );
+                        (trip_id, day_offset, trip.stop_times.as_slice())
+                    })
+                    .collect();
+            trips_with_schedules.sort_by_key(|(_, day_offset, st)| {
+                let raw_dep = st[0].departure_time.expect(
+                    "first stop_time.departure_time is required by the GtfsError::MissingDepartureTime check earlier in new()",
+                );
+                shift_dep(raw_dep, *day_offset)
+            });
+
+            for sub_group in split_non_overtaking(&trips_with_schedules) {
+                let route_idx = RouteIdx::new(route_ids.len() as u32);
+                route_ids.push(gtfs_route_id.to_owned());
+                stops_for_route.push(stop_seq.clone());
+
+                let mut sub_trip_idxs: Vec<TripIdx> = Vec::with_capacity(sub_group.len());
+                for (trip_id, _day_offset) in &sub_group {
+                    let trip_idx = TripIdx::new(trip_ids.len() as u32);
+                    trip_ids.push((*trip_id).to_owned());
+                    // trip_by_id maps to the FIRST occurrence (lowest
+                    // day_offset) so external `tt.trip_idx(id)` lookups
+                    // are deterministic when a trip is active on
+                    // multiple days. Subsequent days' instances are
+                    // reachable via `route_for_trip` / `trips_for_route`.
+                    trip_by_id.entry((*trip_id).to_owned()).or_insert(trip_idx);
+                    sub_trip_idxs.push(trip_idx);
+                    debug_assert_eq!(route_for_trip.len(), trip_idx.idx());
+                    route_for_trip.push((route_idx, sub_trip_idxs.len() - 1));
+                }
+
+                // Per-route arrival/departure tables: shape [stop_pos][trip_pos].
+                // Single per-trip pass that also captures pickup/drop-off
+                // and wheelchair flags, so we look up each trip once.
+                let n_stops_in_route = stop_seq.len();
+                let n_trips_in_route = sub_group.len();
+                let mut arr_table: Vec<Vec<SecondOfDay>> =
+                    vec![vec![SecondOfDay::MAX; n_trips_in_route]; n_stops_in_route];
+                let mut dep_table: Vec<Vec<SecondOfDay>> =
+                    vec![vec![SecondOfDay::MAX; n_trips_in_route]; n_stops_in_route];
+                for (trip_pos, (trip_id, day_offset)) in sub_group.iter().enumerate() {
+                    let trip = gtfs.get_trip(trip_id).expect(
+                        "trip_id originated from gtfs.trips and survived service-day filtering",
+                    );
+                    let trip_idx = sub_trip_idxs[trip_pos];
+                    if matches!(trip.wheelchair_accessible, Availability::NotAvailable) {
+                        inaccessible_trips.insert(trip_idx);
+                    }
+                    for (stop_pos, st) in trip.stop_times.iter().enumerate() {
+                        if let Some(a) = st.arrival_time {
+                            arr_table[stop_pos][trip_pos] = shift_dep(a, *day_offset);
+                        }
+                        let d = st.departure_time.expect(
+                            "stop_time.departure_time is required by the GtfsError::MissingDepartureTime check earlier in new()",
+                        );
+                        dep_table[stop_pos][trip_pos] = shift_dep(d, *day_offset);
+                        if matches!(st.pickup_type, PickupDropOffType::NotAvailable) {
+                            no_pickup.insert((trip_idx, stop_pos as u32));
+                        }
+                        if matches!(st.drop_off_type, PickupDropOffType::NotAvailable) {
+                            no_drop_off.insert((trip_idx, stop_pos as u32));
+                        }
+                    }
+                }
+                arrival_times.push(arr_table);
+                departure_times.push(dep_table);
+                trips_for_route.push(sub_trip_idxs);
+
+                route_by_id
+                    .entry(gtfs_route_id.to_owned())
+                    .or_insert(route_idx);
+                routes_by_gtfs_id
+                    .entry(gtfs_route_id.to_owned())
+                    .or_default()
+                    .push(route_idx);
+
+                for (pos, &stop_idx) in stop_seq.iter().enumerate() {
+                    let entry = &mut routes_for_stop[stop_idx.idx()];
+                    if !entry.iter().any(|(r, _)| *r == route_idx) {
+                        entry.push((route_idx, pos as u32));
+                    }
+                }
+            }
+        }
+
+        // 4. Footpaths and transfer times.
+        let mut footpaths_for_stops: Vec<SmallVec<[StopIdx; TYPICAL_TRANSFERS_PER_STOP]>> =
+            vec![SmallVec::new(); stop_ids.len()];
+        let mut transfer_times: HashMap<(StopIdx, StopIdx), Duration> = HashMap::new();
+        let mut transfers_by_type = TransfersByType::default();
+        for (stop_id, stop) in &gtfs.stops {
+            if stop.transfers.is_empty() {
+                continue;
+            }
+            let from_idx = *stop_by_id
+                .get(stop_id.as_str())
+                .expect("every stop_id was interned by the stops loop at the start of new()");
+            for t in &stop.transfers {
+                match t.transfer_type {
+                    gtfs_structures::TransferType::Recommended => {
+                        transfers_by_type.recommended += 1;
+                    }
+                    gtfs_structures::TransferType::Timed => transfers_by_type.timed += 1,
+                    gtfs_structures::TransferType::MinTime => transfers_by_type.min_time += 1,
+                    gtfs_structures::TransferType::Impossible => {
+                        transfers_by_type.impossible += 1;
+                        // Skip type 3: the publisher is explicitly
+                        // forbidding the transfer (typically for
+                        // geographically close stops that aren't
+                        // connected by walkable infrastructure, e.g.
+                        // opposite sides of a motorway).
+                        continue;
+                    }
+                    gtfs_structures::TransferType::StayOnBoard => {
+                        transfers_by_type.stay_on_board += 1;
+                    }
+                    gtfs_structures::TransferType::MustAlight => {
+                        transfers_by_type.must_alight += 1;
+                    }
+                }
+                let Some(&to_idx) = stop_by_id.get(t.to_stop_id.as_str()) else {
+                    continue;
+                };
+                footpaths_for_stops[from_idx.idx()].push(to_idx);
+                if let Some(min) = t.min_transfer_time {
+                    transfer_times.insert((from_idx, to_idx), Duration(min));
+                }
+            }
+        }
+
+        // 5. Group child stops by their parent_station, so that callers
+        //    can later query "all platforms of station X" with one lookup.
+        let mut station_children: HashMap<String, Vec<(StopIdx, Duration)>> = HashMap::new();
+        for (stop_id, stop) in &gtfs.stops {
+            if let Some(parent) = stop.parent_station.as_deref()
+                && let Some(&child_idx) = stop_by_id.get(stop_id.as_str())
+                && gtfs.stops.contains_key(parent)
+            {
+                station_children
+                    .entry(parent.to_owned())
+                    .or_default()
+                    .push((child_idx, Duration::ZERO));
+            }
+        }
+
+        // 6. Count how many of the kept trips have a populated shape that
+        //    actually resolves in `gtfs.shapes`. This is what
+        //    `shape_for_leg` will return polylines for.
+        let mut n_trips_with_shapes: usize = 0;
+        for trip_id in &trip_ids {
+            if let Some(trip) = gtfs.trips.get(trip_id)
+                && let Some(shape_id) = trip.shape_id.as_deref()
+                && gtfs.shapes.contains_key(shape_id)
+            {
+                n_trips_with_shapes += 1;
+            }
+        }
+
+        Ok(Self {
+            stop_ids,
+            route_ids,
+            trip_ids,
+            stop_by_id,
+            route_by_id,
+            routes_by_gtfs_id,
+            trip_by_id,
+            routes_for_stop,
+            stops_for_route,
+            trips_for_route,
+            arrival_times,
+            departure_times,
+            route_for_trip,
+            footpaths_for_stops,
+            transfer_times,
+            transfers_closed: false,
+            station_children,
+            no_pickup,
+            no_drop_off,
+            inaccessible_trips,
+            inaccessible_stops,
+            n_stops_with_coords,
+            n_parent_stations,
+            n_trips_with_shapes,
+            transfers_by_type,
+            walking_footpaths_added: false,
+        })
+    }
+
+    /// Asserts that the current footpath relation is transitively
+    /// closed and instructs the algorithm to use the single-pass
+    /// `O(E)` relaxation instead of multi-source Dijkstra. Returns
+    /// `self` for chaining.
+    ///
+    /// A relation is *transitively closed* when every reachable walk
+    /// is already a single direct edge – `A → B` and `B → C` implies
+    /// `A → C` is in the relation too. See the [`Timetable`] trait's
+    /// Footpaths section for the full discussion and the soundness
+    /// contract.
+    ///
+    /// Use when you know the underlying `transfers.txt` (or any
+    /// pre-processing you've applied) is closed – typically true for
+    /// publisher-curated feeds like Berlin VBB or Paris IDFM.
+    ///
+    /// **Soundness**: asserting closure on a non-closed relation will
+    /// cause the algorithm to miss journeys whose optimal path
+    /// requires chaining direct walks within a round. If unsure,
+    /// don't call this – the Dijkstra fallback is always sound.
+    ///
+    /// [`GtfsTimetable::with_walking_footpaths`] sets the same flag for
+    /// a different reason – its R-tree-derived edges enforce a per-leg
+    /// max walking distance, and the closed runtime is what prevents
+    /// the algorithm from chaining short walks beyond the cap.
+    pub fn assert_footpaths_closed(mut self) -> Self {
+        self.transfers_closed = true;
+        self
+    }
+
+    /// Returns the child platforms of a parent station as a slice ready
+    /// to pass to [`Query::from`] / [`Query::to`] as origins or targets.
+    ///
+    /// [`Query::from`]: crate::Query::from
+    /// [`Query::to`]: crate::Query::to
+    ///
+    /// Each entry is `(platform_stop_idx, walk_time)` where `walk_time`
+    /// defaults to 0 (the user is willing to use any platform without
+    /// further wait). Returns an empty slice if `parent_id` is not the
+    /// GTFS id of a parent station, or if the station has no children.
+    pub fn station_stops(&self, parent_id: &str) -> &[(StopIdx, Duration)] {
+        self.station_children
+            .get(parent_id)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// Augments the footpath graph with bidirectional walking edges
+    /// between every pair of stops within `max_distance_m` straight-line
+    /// distance, computed via an equirectangular projection anchored at
+    /// the feed's mean latitude (accurate to ~0.5% at city scale).
+    ///
+    /// Walk time per edge = `distance_m / walking_speed_m_per_s`,
+    /// rounded up. Existing transfers from `transfers.txt` are preserved
+    /// – coordinate-derived edges are only added where no explicit
+    /// transfer between the pair already exists.
+    ///
+    /// `max_distance_m` is a per-leg cap, not a per-edge one: the
+    /// returned timetable reports
+    /// [`Timetable::footpaths_are_transitively_closed`] as `true`, so
+    /// the runtime takes at most one walk per round and never chains
+    /// short straight-line edges to a fixed point. Without this, dense
+    /// stop graphs (e.g. a 3,000-stop regional feed with 500 m edges)
+    /// would let a single walking phase traverse several kilometres by
+    /// hopping between stops; flipping closure on matches the
+    /// cap-during-preprocessing pattern from the original RAPTOR paper
+    /// and gives users the per-leg semantic they expect from
+    /// "max walking distance". By the triangle inequality, any
+    /// straight-line walk between two stops within the cap is already
+    /// the shortest-time edge in the relation, so closure is exact for
+    /// the coordinate-derived subset; `transfers.txt` entries keep the
+    /// publisher's stated walk time and are likewise treated as a
+    /// single direct walk (chained `transfers.txt` walks, if any
+    /// publisher relies on them, will not be discovered – use
+    /// [`GtfsTimetable::assert_footpaths_closed`] instead if your feed
+    /// needs closure on a different basis).
+    ///
+    /// Typical values: `max_distance_m = 500` (covers same-block
+    /// interchanges), `walking_speed_m_per_s = 1.4` (≈ 5 km/h, the
+    /// standard pedestrian rate). Returns `self` so the call chains
+    /// after [`GtfsTimetable::new`].
+    pub fn with_walking_footpaths(
+        mut self,
+        gtfs: &Gtfs,
+        max_distance_m: f64,
+        walking_speed_m_per_s: f64,
+    ) -> Self {
+        // Reference latitude: mean across stops with valid coords.
+        let mut sum_lat = 0.0;
+        let mut n_with_coords = 0usize;
+        for stop in gtfs.stops.values() {
+            if let (Some(lat), Some(_)) = (stop.latitude, stop.longitude) {
+                sum_lat += lat;
+                n_with_coords += 1;
+            }
+        }
+        if n_with_coords == 0 {
+            return self;
+        }
+        let mean_lat_rad = (sum_lat / n_with_coords as f64).to_radians();
+        let lon_scale = mean_lat_rad.cos() * EARTH_RADIUS_M;
+        let lat_scale = EARTH_RADIUS_M;
+
+        // Project every stop into local Cartesian metres.
+        let mut projected: Vec<ProjectedStop> = Vec::with_capacity(n_with_coords);
+        for (stop_id, stop) in &gtfs.stops {
+            if let (Some(lat), Some(lon)) = (stop.latitude, stop.longitude)
+                && let Some(&idx) = self.stop_by_id.get(stop_id.as_str())
+            {
+                let x = lon.to_radians() * lon_scale;
+                let y = lat.to_radians() * lat_scale;
+                projected.push(ProjectedStop { pos: [x, y], idx });
+            }
+        }
+
+        let tree = RTree::bulk_load(projected.clone());
+        let r2 = max_distance_m * max_distance_m;
+
+        for from in &projected {
+            for near in tree.locate_within_distance(from.pos, r2) {
+                if near.idx == from.idx {
+                    continue;
+                }
+                // Skip if an explicit transfers.txt entry already covers
+                // this directed pair – keep the publisher's value.
+                if self.transfer_times.contains_key(&(from.idx, near.idx)) {
+                    continue;
+                }
+                let dx = from.pos[0] - near.pos[0];
+                let dy = from.pos[1] - near.pos[1];
+                let dist_m = (dx * dx + dy * dy).sqrt();
+                let walk_time = Duration((dist_m / walking_speed_m_per_s).ceil() as u32);
+
+                self.footpaths_for_stops[from.idx.idx()].push(near.idx);
+                self.transfer_times.insert((from.idx, near.idx), walk_time);
+            }
+        }
+
+        // Mark the relation closed so the per-round relaxation takes
+        // the single-pass `O(E)` path rather than chaining straight-line
+        // walks to a fixed point. This is what enforces the user-facing
+        // "max walking distance per leg" semantic – see the doc comment
+        // above for why this is sound for R-tree-derived edges.
+        self.transfers_closed = true;
+        self.walking_footpaths_added = true;
+        self
+    }
+
+    /// Number of trips active on the timetable's service date (i.e. the
+    /// trips that survived calendar filtering at construction).
+    pub fn n_trips(&self) -> usize {
+        self.trip_ids.len()
+    }
+
+    /// Returns a [`FeedFeatures`] snapshot describing what's in this
+    /// timetable: stop / trip / route counts, `transfers.txt` shape,
+    /// shape-availability, and the current state of the footpath
+    /// graph. Cheap (linear in the footpath edge count to fold
+    /// `n_footpaths`; everything else is precomputed).
+    ///
+    /// See [`FeedFeatures::suggestions`] for an advisory list of
+    /// vulture knobs that may be worth turning given the snapshot.
+    pub fn features(&self) -> FeedFeatures {
+        let n_footpaths = self
+            .footpaths_for_stops
+            .iter()
+            .map(|v| v.len())
+            .sum::<usize>();
+        FeedFeatures {
+            n_stops: self.stop_ids.len(),
+            n_stops_with_coords: self.n_stops_with_coords,
+            n_parent_stations: self.n_parent_stations,
+            n_inaccessible_stops: self.inaccessible_stops.len(),
+            n_routes: self.route_ids.len(),
+            n_trips: self.trip_ids.len(),
+            n_inaccessible_trips: self.inaccessible_trips.len(),
+            n_trips_with_shapes: self.n_trips_with_shapes,
+            transfers_by_type: self.transfers_by_type,
+            walking_footpaths_added: self.walking_footpaths_added,
+            footpaths_closed: self.transfers_closed,
+            n_footpaths,
+        }
+    }
+
+    /// Returns the original GTFS `stop_id` for the given index.
+    pub fn stop_id(&self, stop: StopIdx) -> &str {
+        &self.stop_ids[stop.idx()]
+    }
+
+    /// Returns the original GTFS `route_id` for the given synthetic route.
+    /// Several `RouteIdx`s may map to the same GTFS `route_id`.
+    pub fn route_id(&self, route: RouteIdx) -> &str {
+        &self.route_ids[route.idx()]
+    }
+
+    /// Returns the original GTFS `trip_id` for the given index.
+    pub fn trip_id(&self, trip: TripIdx) -> &str {
+        &self.trip_ids[trip.idx()]
+    }
+
+    /// Looks up the index of a stop by its GTFS `stop_id`.
+    pub fn stop_idx(&self, id: &str) -> Option<StopIdx> {
+        self.stop_by_id.get(id).copied()
+    }
+
+    /// Looks up the *first* synthetic route derived from a GTFS
+    /// `route_id`. Use [`routes_for_gtfs_id`](Self::routes_for_gtfs_id) to
+    /// enumerate every synthetic.
+    pub fn route_idx(&self, id: &str) -> Option<RouteIdx> {
+        self.route_by_id.get(id).copied()
+    }
+
+    /// Returns every synthetic route derived from a given GTFS `route_id`.
+    pub fn routes_for_gtfs_id(&self, id: &str) -> &[RouteIdx] {
+        self.routes_by_gtfs_id
+            .get(id)
+            .map(|sv| sv.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// Looks up the index of a trip by its GTFS `trip_id`.
+    pub fn trip_idx(&self, id: &str) -> Option<TripIdx> {
+        self.trip_by_id.get(id).copied()
+    }
+
+    /// Polyline points (lat, lon) for the segment of `trip_id`'s shape
+    /// between `board_stop` and `alight_stop`. Returns `None` if
+    /// `trip_id` is unknown to the feed, the trip has no shape, or
+    /// the requested stops are not on the trip.
+    ///
+    /// Uses `shape_dist_traveled` for exact slicing when both
+    /// stop_times entries have it set; otherwise projects each stop's
+    /// coordinates onto the polyline and slices to the closest two
+    /// shape points (the standard fallback for feeds without
+    /// distance-traveled data). The returned polyline begins at the
+    /// nearest shape point at-or-inside the leg's distance range and
+    /// ends at the nearest shape point at-or-inside the alighting
+    /// stop — for sparse shapes this can leave a small visible gap
+    /// between the last shape point and the stop coordinate.
+    ///
+    /// Primarily for FFI consumers visualising journeys on a map.
+    /// The companion `vulture-wasm` crate bakes this into the per-leg
+    /// JSON returned by `runArrival` / `runRange`.
+    pub fn shape_for_leg(
+        &self,
+        gtfs: &Gtfs,
+        trip_id: &str,
+        board_stop: StopIdx,
+        alight_stop: StopIdx,
+    ) -> Option<Vec<(f32, f32)>> {
+        let trip = gtfs.trips.get(trip_id)?;
+        let shape_id = trip.shape_id.as_deref()?;
+        let shape = gtfs.shapes.get(shape_id)?;
+        if shape.is_empty() {
+            return None;
+        }
+        let mut shape_sorted: Vec<&gtfs_structures::Shape> = shape.iter().collect();
+        shape_sorted.sort_by_key(|s| s.sequence);
+
+        let board_id = self.stop_id(board_stop);
+        let alight_id = self.stop_id(alight_stop);
+        let board_st = trip.stop_times.iter().find(|st| st.stop.id == board_id)?;
+        let alight_st = trip.stop_times.iter().find(|st| st.stop.id == alight_id)?;
+
+        if let (Some(b_dist), Some(a_dist)) =
+            (board_st.shape_dist_traveled, alight_st.shape_dist_traveled)
+        {
+            return Some(slice_shape_by_dist(&shape_sorted, b_dist, a_dist));
+        }
+
+        let board_coord = (
+            board_st.stop.latitude? as f32,
+            board_st.stop.longitude? as f32,
+        );
+        let alight_coord = (
+            alight_st.stop.latitude? as f32,
+            alight_st.stop.longitude? as f32,
+        );
+        Some(slice_shape_by_projection(
+            &shape_sorted,
+            board_coord,
+            alight_coord,
+        ))
+    }
+}
+
+/// Greedily split a departure-sorted list of trips on a shared stop
+/// sequence into sub-groups within which no trip overtakes any earlier
+/// trip in the same sub-group.
+///
+/// Insertion order: each trip is appended to the first sub-group whose
+/// last trip it does not overtake; otherwise a new sub-group is opened.
+/// Within a sub-group "doesn't overtake the last trip" extends to the
+/// whole sub-group by transitivity (all members are pairwise
+/// non-overtaking and times are monotone over the sequence).
+fn split_non_overtaking<'gtfs>(
+    trips: &[(&'gtfs str, u8, &'gtfs [gtfs_structures::StopTime])],
+) -> Vec<Vec<(&'gtfs str, u8)>> {
+    let mut sub_groups: Vec<Vec<(&'gtfs str, u8, &'gtfs [gtfs_structures::StopTime])>> = Vec::new();
+    'outer: for &entry in trips {
+        for sub_group in &mut sub_groups {
+            let (_, last_day, last_st) = *sub_group
+                .last()
+                .expect("sub_groups are seeded with vec![entry] and only ever grown");
+            if !overtakes(last_st, last_day, entry.2, entry.1) {
+                sub_group.push(entry);
+                continue 'outer;
+            }
+        }
+        sub_groups.push(vec![entry]);
+    }
+    sub_groups
+        .into_iter()
+        .map(|g| {
+            g.into_iter()
+                .map(|(id, day_offset, _)| (id, day_offset))
+                .collect()
+        })
+        .collect()
+}
+
+/// Shift a raw GTFS departure / arrival time (seconds since the
+/// service-day's anchor) by `day_offset × 86 400` so day-`d` trips
+/// sit strictly after day-`(d-1)` trips on the same RAPTOR route.
+fn shift_dep(raw: u32, day_offset: u8) -> SecondOfDay {
+    SecondOfDay(raw.saturating_add(u32::from(day_offset) * 86_400))
+}
+
+/// Returns true if `later` overtakes `earlier` at any stop, comparing
+/// times *after* the per-trip day-offset shift. Both schedules are
+/// assumed to share a stop sequence and to have departure times at
+/// every stop (validated at construction).
+fn overtakes(
+    earlier: &[gtfs_structures::StopTime],
+    earlier_day: u8,
+    later: &[gtfs_structures::StopTime],
+    later_day: u8,
+) -> bool {
+    earlier.iter().zip(later).any(|(es, ls)| {
+        let e_dep = shift_dep(
+            es.departure_time.expect(
+                "stop_time.departure_time is required by the GtfsError::MissingDepartureTime check earlier in GtfsTimetable::new()",
+            ),
+            earlier_day,
+        );
+        let l_dep = shift_dep(
+            ls.departure_time.expect(
+                "stop_time.departure_time is required by the GtfsError::MissingDepartureTime check earlier in GtfsTimetable::new()",
+            ),
+            later_day,
+        );
+        if l_dep < e_dep {
+            return true;
+        }
+        // A later trip whose arrival at some stop is earlier than the
+        // earlier trip's arrival is also overtaking.
+        matches!(
+            (es.arrival_time, ls.arrival_time),
+            (Some(e_arr), Some(l_arr)) if shift_dep(l_arr, later_day) < shift_dep(e_arr, earlier_day)
+        )
+    })
+}
+
+impl Timetable for GtfsTimetable {
+    fn n_stops(&self) -> usize {
+        self.stop_ids.len()
+    }
+
+    fn n_routes(&self) -> usize {
+        self.route_ids.len()
+    }
+
+    fn get_routes_serving_stop(&self, stop: StopIdx) -> &[(RouteIdx, u32)] {
+        self.routes_for_stop[stop.idx()].as_slice()
+    }
+
+    fn get_stops_after(&self, route: RouteIdx, pos: u32) -> &[StopIdx] {
+        let stops = &self.stops_for_route[route.idx()];
+        &stops[pos as usize..]
+    }
+
+    fn stop_at(&self, route: RouteIdx, pos: u32) -> StopIdx {
+        self.stops_for_route[route.idx()][pos as usize]
+    }
+
+    fn get_earliest_trip(&self, route: RouteIdx, at: SecondOfDay, pos: u32) -> Option<TripIdx> {
+        let trips = &self.trips_for_route[route.idx()];
+        let dep_row = &self.departure_times[route.idx()][pos as usize];
+        let idx = dep_row.partition_point(|&dep| dep < at);
+        // Common case (no_pickup empty for metro feeds): a single read.
+        if self.no_pickup.is_empty() {
+            return trips.get(idx).copied();
+        }
+        let mut idx = idx;
+        while let Some(&trip) = trips.get(idx) {
+            if !self.no_pickup.contains(&(trip, pos)) {
+                return Some(trip);
+            }
+            idx += 1;
+        }
+        None
+    }
+
+    fn earliest_accessible_trip(
+        &self,
+        route: RouteIdx,
+        at: SecondOfDay,
+        pos: u32,
+        require_wheelchair_accessible: bool,
+    ) -> Option<TripIdx> {
+        if !require_wheelchair_accessible {
+            return self.get_earliest_trip(route, at, pos);
+        }
+        // Walk by trip index, not by time, so simultaneously-departing
+        // trips that differ only in their wheelchair flag don't get
+        // leapfrogged by the trait's default `+1s` fallback.
+        let trips = &self.trips_for_route[route.idx()];
+        let dep_row = &self.departure_times[route.idx()][pos as usize];
+        let mut idx = dep_row.partition_point(|&dep| dep < at);
+        let no_pickup_empty = self.no_pickup.is_empty();
+        while let Some(&trip) = trips.get(idx) {
+            let pickup_ok = no_pickup_empty || !self.no_pickup.contains(&(trip, pos));
+            if pickup_ok && !self.inaccessible_trips.contains(&trip) {
+                return Some(trip);
+            }
+            idx += 1;
+        }
+        None
+    }
+
+    fn get_arrival_time(&self, trip: TripIdx, pos: u32) -> SecondOfDay {
+        let (route_idx, trip_pos) = self.route_for_trip[trip.idx()];
+        self.arrival_times[route_idx.idx()][pos as usize][trip_pos]
+    }
+
+    fn get_departure_time(&self, trip: TripIdx, pos: u32) -> SecondOfDay {
+        let (route_idx, trip_pos) = self.route_for_trip[trip.idx()];
+        self.departure_times[route_idx.idx()][pos as usize][trip_pos]
+    }
+
+    fn get_footpaths_from(&self, stop: StopIdx) -> &[StopIdx] {
+        self.footpaths_for_stops[stop.idx()].as_slice()
+    }
+
+    fn get_transfer_time(&self, from: StopIdx, to: StopIdx) -> Duration {
+        self.transfer_times
+            .get(&(from, to))
+            .copied()
+            .unwrap_or(DEFAULT_TRANSFER_TIME)
+    }
+
+    fn pickup_allowed(&self, trip: TripIdx, pos: u32) -> bool {
+        // is_empty() short-circuit: typical metro feeds have no
+        // pickup_type=1 entries at all, so we skip the hash entirely.
+        self.no_pickup.is_empty() || !self.no_pickup.contains(&(trip, pos))
+    }
+
+    fn drop_off_allowed(&self, trip: TripIdx, pos: u32) -> bool {
+        self.no_drop_off.is_empty() || !self.no_drop_off.contains(&(trip, pos))
+    }
+
+    fn trip_wheelchair_accessible(&self, trip: TripIdx) -> bool {
+        self.inaccessible_trips.is_empty() || !self.inaccessible_trips.contains(&trip)
+    }
+
+    fn stop_wheelchair_accessible(&self, stop: StopIdx) -> bool {
+        self.inaccessible_stops.is_empty() || !self.inaccessible_stops.contains(&stop)
+    }
+
+    fn footpaths_are_transitively_closed(&self) -> bool {
+        self.transfers_closed
+    }
+}
+
+/// Slice a polyline by `shape_dist_traveled` cumulative distance.
+/// `shape` is the shape's points sorted ascending by `sequence`.
+/// Returns the inclusive range `[board_dist, alight_dist]`. If
+/// `alight_dist < board_dist`, returns an empty Vec.
+fn slice_shape_by_dist(
+    shape: &[&gtfs_structures::Shape],
+    board_dist: f32,
+    alight_dist: f32,
+) -> Vec<(f32, f32)> {
+    let (lo, hi) = if board_dist <= alight_dist {
+        (board_dist, alight_dist)
+    } else {
+        return Vec::new();
+    };
+    shape
+        .iter()
+        .filter_map(|s| {
+            let d = s.dist_traveled?;
+            if d >= lo && d <= hi {
+                Some((s.latitude as f32, s.longitude as f32))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// Slice a polyline by projecting two coordinates onto it and
+/// returning the inclusive range between the closest shape points.
+/// `shape` is sorted ascending by `sequence`. Distance is squared
+/// Euclidean in lat/lon space — adequate for the "find the closest
+/// shape point" task at city scale.
+fn slice_shape_by_projection(
+    shape: &[&gtfs_structures::Shape],
+    board: (f32, f32),
+    alight: (f32, f32),
+) -> Vec<(f32, f32)> {
+    let nearest = |target: (f32, f32)| -> usize {
+        shape
+            .iter()
+            .enumerate()
+            .min_by(|(_, a), (_, b)| {
+                let da = sq_dist((a.latitude as f32, a.longitude as f32), target);
+                let db = sq_dist((b.latitude as f32, b.longitude as f32), target);
+                da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|(i, _)| i)
+            .unwrap_or(0)
+    };
+    let bi = nearest(board);
+    let ai = nearest(alight);
+    let (lo, hi) = if bi <= ai {
+        (bi, ai)
+    } else {
+        return Vec::new();
+    };
+    shape[lo..=hi]
+        .iter()
+        .map(|s| (s.latitude as f32, s.longitude as f32))
+        .collect()
+}
+
+#[inline]
+fn sq_dist(a: (f32, f32), b: (f32, f32)) -> f32 {
+    let dx = a.0 - b.0;
+    let dy = a.1 - b.1;
+    dx * dx + dy * dy
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gtfs_structures::{Calendar, CalendarDate, StopTime};
+
+    fn st(arr: u32, dep: u32) -> StopTime {
+        StopTime {
+            arrival_time: Some(arr),
+            departure_time: Some(dep),
+            ..Default::default()
+        }
+    }
+
+    /// Build a minimal `Gtfs` with one calendar entry running Mon-Fri
+    /// throughout 2026 for service "weekday".
+    fn weekday_only_feed() -> Gtfs {
+        let mut g = Gtfs::default();
+        g.calendar.insert(
+            "weekday".into(),
+            Calendar {
+                id: "weekday".into(),
+                monday: true,
+                tuesday: true,
+                wednesday: true,
+                thursday: true,
+                friday: true,
+                saturday: false,
+                sunday: false,
+                start_date: NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
+                end_date: NaiveDate::from_ymd_opt(2026, 12, 31).unwrap(),
+            },
+        );
+        g
+    }
+
+    fn ymd(y: i32, m: u32, d: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(y, m, d).unwrap()
+    }
+
+    #[test]
+    fn calendar_active_on_weekday_inside_window() {
+        let gtfs = weekday_only_feed();
+        // 2026-05-04 is a Monday inside the window.
+        assert!(is_service_active(&gtfs, "weekday", ymd(2026, 5, 4)));
+    }
+
+    #[test]
+    fn calendar_inactive_on_weekend_inside_window() {
+        let gtfs = weekday_only_feed();
+        // 2026-05-02 is a Saturday – flag is false.
+        assert!(!is_service_active(&gtfs, "weekday", ymd(2026, 5, 2)));
+    }
+
+    #[test]
+    fn calendar_inactive_outside_date_window() {
+        let gtfs = weekday_only_feed();
+        // 2025-12-31 is a Wednesday but before start_date.
+        assert!(!is_service_active(&gtfs, "weekday", ymd(2025, 12, 31)));
+        // 2027-01-04 is a Monday but after end_date.
+        assert!(!is_service_active(&gtfs, "weekday", ymd(2027, 1, 4)));
+    }
+
+    #[test]
+    fn calendar_dates_added_overrides_calendar_inactive() {
+        let mut gtfs = weekday_only_feed();
+        // Add a Saturday exception.
+        gtfs.calendar_dates.insert(
+            "weekday".into(),
+            vec![CalendarDate {
+                service_id: "weekday".into(),
+                date: ymd(2026, 5, 2),
+                exception_type: Exception::Added,
+            }],
+        );
+        assert!(is_service_active(&gtfs, "weekday", ymd(2026, 5, 2)));
+    }
+
+    #[test]
+    fn calendar_dates_deleted_overrides_calendar_active() {
+        let mut gtfs = weekday_only_feed();
+        // Cancel the Monday 2026-05-04 service.
+        gtfs.calendar_dates.insert(
+            "weekday".into(),
+            vec![CalendarDate {
+                service_id: "weekday".into(),
+                date: ymd(2026, 5, 4),
+                exception_type: Exception::Deleted,
+            }],
+        );
+        assert!(!is_service_active(&gtfs, "weekday", ymd(2026, 5, 4)));
+    }
+
+    #[test]
+    fn unknown_service_id_is_inactive() {
+        let gtfs = weekday_only_feed();
+        assert!(!is_service_active(
+            &gtfs,
+            "no-such-service",
+            ymd(2026, 5, 4)
+        ));
+    }
+
+    #[test]
+    fn overtakes_detects_arrival_inversion() {
+        // Two stops; later trip arrives before earlier trip at the second stop.
+        let earlier = vec![st(0, 0), st(20, 20)];
+        let later = vec![st(5, 5), st(15, 15)];
+        assert!(overtakes(&earlier, 0, &later, 0));
+    }
+
+    #[test]
+    fn overtakes_detects_departure_inversion() {
+        // Later trip's departure precedes earlier's at the second stop.
+        let earlier = vec![st(0, 0), st(10, 30)];
+        let later = vec![st(5, 5), st(10, 20)];
+        assert!(overtakes(&earlier, 0, &later, 0));
+    }
+
+    #[test]
+    fn non_overtaking_pair_is_clean() {
+        let earlier = vec![st(0, 0), st(10, 10)];
+        let later = vec![st(5, 5), st(15, 15)];
+        assert!(!overtakes(&earlier, 0, &later, 0));
+    }
+
+    #[test]
+    fn equal_schedules_do_not_overtake() {
+        // Two trips with identical schedules don't overtake each other.
+        let a = vec![st(0, 0), st(10, 10)];
+        let b = vec![st(0, 0), st(10, 10)];
+        assert!(!overtakes(&a, 0, &b, 0));
+    }
+
+    #[test]
+    fn day_offset_keeps_overlapping_schedules_non_overtaking() {
+        // Two trips with the same raw schedule but different day_offset
+        // values are *not* overtaking — day-1 starts strictly after
+        // day-0 ends thanks to the +86400 shift.
+        let day0 = vec![st(0, 0), st(10, 10)];
+        let day1 = vec![st(0, 0), st(10, 10)];
+        assert!(!overtakes(&day0, 0, &day1, 1));
+        // The reverse direction *is* overtaking — day-0 trip would
+        // arrive long before the day-1 trip if treated as `later`.
+        assert!(overtakes(&day1, 1, &day0, 0));
+    }
+
+    #[test]
+    fn split_keeps_non_overtaking_trips_in_one_group() {
+        let t1 = vec![st(0, 0), st(10, 10)];
+        let t2 = vec![st(5, 5), st(15, 15)];
+        let t3 = vec![st(10, 10), st(20, 20)];
+        let trips = vec![
+            ("t1", 0u8, t1.as_slice()),
+            ("t2", 0u8, t2.as_slice()),
+            ("t3", 0u8, t3.as_slice()),
+        ];
+        let groups = split_non_overtaking(&trips);
+        assert_eq!(groups, vec![vec![("t1", 0), ("t2", 0), ("t3", 0)]]);
+    }
+
+    #[test]
+    fn split_separates_overtaking_trips() {
+        // t1 departs first but is overtaken by t2 (the express).
+        let t1_local = vec![st(0, 0), st(60, 60)];
+        let t2_express = vec![st(10, 10), st(20, 20)];
+        let t3_local = vec![st(70, 70), st(130, 130)];
+        let trips = vec![
+            ("t1", 0u8, t1_local.as_slice()),
+            ("t2", 0u8, t2_express.as_slice()),
+            ("t3", 0u8, t3_local.as_slice()),
+        ];
+        let groups = split_non_overtaking(&trips);
+        // Two non-overtaking sub-groups: {t1, t3} (locals) and {t2} (express).
+        // Greedy insertion places t2 in a new sub-group when it overtakes t1,
+        // then t3 lands in the t1 sub-group since it doesn't overtake t1.
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0], vec![("t1", 0), ("t3", 0)]);
+        assert_eq!(groups[1], vec![("t2", 0)]);
+    }
+
+    #[test]
+    fn gtfs_error_messages_carry_route_and_agency() {
+        let with_agency = GtfsError::MissingStopTimes {
+            trip: "t-42".into(),
+            route: "r-7".into(),
+            agency: Some("a-99".into()),
+        };
+        let msg = with_agency.to_string();
+        assert!(msg.contains("t-42"), "missing trip id in {msg}");
+        assert!(msg.contains("r-7"), "missing route id in {msg}");
+        assert!(msg.contains("a-99"), "missing agency id in {msg}");
+
+        let without_agency = GtfsError::MissingStop {
+            stop: "s-1".into(),
+            trip: "t-42".into(),
+            route: "r-7".into(),
+            agency: None,
+        };
+        let msg = without_agency.to_string();
+        assert!(msg.contains("s-1"));
+        assert!(msg.contains("t-42"));
+        assert!(msg.contains("r-7"));
+        assert!(
+            msg.contains("agency ?"),
+            "missing agency placeholder in {msg}"
+        );
+    }
+
+    /// Build a synthetic single-route Gtfs: stops A, B; route R; one trip
+    /// per day under the supplied service id, departing 06:00 → 06:30.
+    fn synthetic_overnight_feed() -> Gtfs {
+        use gtfs_structures::{Route, Stop, Trip};
+        use std::sync::Arc;
+
+        let mut g = weekday_only_feed();
+        let stop_a = Arc::new(Stop {
+            id: "A".into(),
+            ..Default::default()
+        });
+        let stop_b = Arc::new(Stop {
+            id: "B".into(),
+            ..Default::default()
+        });
+        g.stops.insert("A".into(), Arc::clone(&stop_a));
+        g.stops.insert("B".into(), Arc::clone(&stop_b));
+
+        g.routes.insert(
+            "R".into(),
+            Route {
+                id: "R".into(),
+                ..Default::default()
+            },
+        );
+
+        let trip = Trip {
+            id: "T".into(),
+            service_id: "weekday".into(),
+            route_id: "R".into(),
+            stop_times: vec![
+                StopTime {
+                    arrival_time: Some(6 * 3600),
+                    departure_time: Some(6 * 3600),
+                    stop: Arc::clone(&stop_a),
+                    ..Default::default()
+                },
+                StopTime {
+                    arrival_time: Some(6 * 3600 + 30 * 60),
+                    departure_time: Some(6 * 3600 + 30 * 60),
+                    stop: Arc::clone(&stop_b),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        g.trips.insert("T".into(), trip);
+        g
+    }
+
+    #[test]
+    fn overnight_days_loads_next_day_trip() {
+        // A 23:00 query on Mon 2026-05-04 cannot catch a single 06:00
+        // trip that departs the same morning. Constructing via
+        // new_with_overnight_days(OvernightDays(1)) makes the next
+        // morning's instance available, shifted by 86 400 s, and the
+        // query finds it.
+        use crate::{Duration, RaptorCache, SecondOfDay, Timetable};
+        use jiff::civil::date;
+
+        let g = synthetic_overnight_feed();
+
+        // Single-day timetable: no journey from a 23:00 query.
+        let tt = GtfsTimetable::new(&g, date(2026, 5, 4)).unwrap();
+        let a = tt.stop_idx("A").unwrap();
+        let b = tt.stop_idx("B").unwrap();
+        let mut cache = RaptorCache::for_timetable(&tt);
+        let journeys = tt
+            .query()
+            .from(a)
+            .to(b)
+            .max_transfers(1)
+            .depart_at(SecondOfDay::hms(23, 0, 0))
+            .run_with_cache(&mut cache);
+        assert!(
+            journeys.iter().all(|j| j.plan.is_empty()),
+            "no journey expected without overnight load"
+        );
+
+        // Multi-day timetable: the next morning's trip is shifted to
+        // 30:00, well after the 23:00 departure, and the journey is
+        // found.
+        let tt =
+            GtfsTimetable::new_with_overnight_days(&g, date(2026, 5, 4), OvernightDays(1)).unwrap();
+        let a = tt.stop_idx("A").unwrap();
+        let b = tt.stop_idx("B").unwrap();
+        let mut cache = RaptorCache::for_timetable(&tt);
+        let journeys = tt
+            .query()
+            .from(&[(a, Duration::ZERO)])
+            .to(&[(b, Duration::ZERO)])
+            .max_transfers(1)
+            .depart_at(SecondOfDay::hms(23, 0, 0))
+            .run_with_cache(&mut cache);
+        let best = journeys
+            .iter()
+            .filter(|j| !j.plan.is_empty())
+            .min_by_key(|j| j.arrival())
+            .expect("overnight journey should exist");
+        // 86 400 (next day) + 6 * 3600 + 30 * 60 = 109 800
+        assert_eq!(best.arrival(), SecondOfDay(86_400 + 6 * 3600 + 30 * 60));
+    }
+
+    #[test]
+    fn overnight_days_zero_matches_single_day_constructor() {
+        // new_with_overnight_days(OvernightDays(0)) must produce the
+        // same set of reachable trips as new() (verified by matching
+        // the feed's single-day reachable arrival).
+        use crate::{RaptorCache, SecondOfDay, Timetable};
+
+        let g = synthetic_overnight_feed();
+        let tt_zero =
+            GtfsTimetable::new_with_overnight_days(&g, ymd_jiff(2026, 5, 4), OvernightDays(0))
+                .unwrap();
+
+        // The synthetic feed has a 06:00 trip on the base date; from
+        // a 05:00 query it should arrive at 06:30 = 23 400.
+        let a = tt_zero.stop_idx("A").unwrap();
+        let b = tt_zero.stop_idx("B").unwrap();
+        let mut cache = RaptorCache::for_timetable(&tt_zero);
+        let journeys = tt_zero
+            .query()
+            .from(a)
+            .to(b)
+            .max_transfers(1)
+            .depart_at(SecondOfDay::hms(5, 0, 0))
+            .run_with_cache(&mut cache);
+        let best = journeys
+            .iter()
+            .filter(|j| !j.plan.is_empty())
+            .min_by_key(|j| j.arrival())
+            .expect("base-day journey should exist");
+        assert_eq!(best.arrival(), SecondOfDay(6 * 3600 + 30 * 60));
+    }
+
+    fn ymd_jiff(y: i16, m: i8, d: i8) -> Date {
+        Date::new(y, m, d).unwrap()
+    }
+
+    #[test]
+    fn slice_shape_by_dist_inclusive_range() {
+        use gtfs_structures::Shape;
+        let s = |seq, lat, lon, d| Shape {
+            id: "x".into(),
+            latitude: lat,
+            longitude: lon,
+            sequence: seq,
+            dist_traveled: Some(d),
+        };
+        let shape_owned = [
+            s(0, 28.6, 77.1, 0.0),
+            s(1, 28.7, 77.2, 100.0),
+            s(2, 28.8, 77.3, 200.0),
+            s(3, 28.9, 77.4, 300.0),
+        ];
+        let shape: Vec<&Shape> = shape_owned.iter().collect();
+        let out = slice_shape_by_dist(&shape, 100.0, 200.0);
+        assert_eq!(out, vec![(28.7, 77.2), (28.8, 77.3)]);
+    }
+
+    #[test]
+    fn slice_shape_by_dist_returns_empty_for_inverted_range() {
+        use gtfs_structures::Shape;
+        let s = |seq, d| Shape {
+            id: "x".into(),
+            latitude: 0.0,
+            longitude: 0.0,
+            sequence: seq,
+            dist_traveled: Some(d),
+        };
+        let shape_owned = [s(0, 0.0), s(1, 100.0)];
+        let shape: Vec<&Shape> = shape_owned.iter().collect();
+        assert_eq!(
+            slice_shape_by_dist(&shape, 100.0, 0.0),
+            Vec::<(f32, f32)>::new()
+        );
+    }
+
+    #[test]
+    fn slice_shape_by_projection_finds_closest_indices() {
+        use gtfs_structures::Shape;
+        let s = |seq, lat, lon| Shape {
+            id: "x".into(),
+            latitude: lat,
+            longitude: lon,
+            sequence: seq,
+            dist_traveled: None,
+        };
+        let shape_owned = [
+            s(0, 0.0, 0.0),
+            s(1, 1.0, 1.0),
+            s(2, 2.0, 2.0),
+            s(3, 3.0, 3.0),
+        ];
+        let shape: Vec<&Shape> = shape_owned.iter().collect();
+        let out = slice_shape_by_projection(&shape, (0.9, 0.9), (2.1, 2.1));
+        assert_eq!(out, vec![(1.0, 1.0), (2.0, 2.0)]);
+    }
+
+    #[test]
+    fn shape_for_leg_returns_polyline_for_delhi_trip_with_shape() {
+        use gtfs_structures::Gtfs;
+        use jiff::civil::date;
+
+        let gtfs = Gtfs::new("../aux/dmrc_gtfs.zip").expect("Delhi GTFS loads");
+        let tt = GtfsTimetable::new(&gtfs, date(2024, 1, 15)).expect("timetable builds");
+
+        let (trip_id, trip) = gtfs
+            .trips
+            .iter()
+            .find(|(_, t)| t.shape_id.is_some() && t.stop_times.len() >= 2)
+            .expect("Delhi has trips with shapes");
+
+        let board_id = &trip.stop_times[0].stop.id;
+        let alight_id = &trip.stop_times.last().unwrap().stop.id;
+        let board_idx = tt.stop_idx(board_id).expect("board stop in catalogue");
+        let alight_idx = tt.stop_idx(alight_id).expect("alight stop in catalogue");
+
+        let shape = tt
+            .shape_for_leg(&gtfs, trip_id, board_idx, alight_idx)
+            .expect("shape extracted");
+
+        assert!(!shape.is_empty(), "shape should be non-empty");
+        for (lat, lon) in &shape {
+            assert!((28.0..30.0).contains(lat), "lat {lat} not in Delhi range");
+            assert!((76.0..78.0).contains(lon), "lon {lon} not in Delhi range");
+        }
+    }
+
+    #[test]
+    fn shape_for_leg_returns_none_for_unknown_trip() {
+        use gtfs_structures::Gtfs;
+        use jiff::civil::date;
+
+        let gtfs = Gtfs::new("../aux/dmrc_gtfs.zip").unwrap();
+        let tt = GtfsTimetable::new(&gtfs, date(2024, 1, 15)).unwrap();
+
+        let some_stop = tt.stop_idx("1").expect("Dilshad Garden");
+        assert!(
+            tt.shape_for_leg(&gtfs, "trip-that-does-not-exist", some_stop, some_stop)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn impossible_transfers_are_excluded_from_footpaths() {
+        use gtfs_structures::{Route, Stop, StopTransfer, TransferType, Trip};
+        use std::sync::Arc;
+
+        let mut g = weekday_only_feed();
+
+        let stop_a = Arc::new(Stop {
+            id: "A".into(),
+            transfers: vec![
+                StopTransfer {
+                    to_stop_id: "B".into(),
+                    transfer_type: TransferType::Recommended,
+                    min_transfer_time: Some(60),
+                },
+                StopTransfer {
+                    to_stop_id: "C".into(),
+                    transfer_type: TransferType::Impossible,
+                    min_transfer_time: None,
+                },
+            ],
+            ..Default::default()
+        });
+        let stop_b = Arc::new(Stop {
+            id: "B".into(),
+            ..Default::default()
+        });
+        let stop_c = Arc::new(Stop {
+            id: "C".into(),
+            ..Default::default()
+        });
+        g.stops.insert("A".into(), Arc::clone(&stop_a));
+        g.stops.insert("B".into(), Arc::clone(&stop_b));
+        g.stops.insert("C".into(), Arc::clone(&stop_c));
+
+        // A trivial trip A -> B keeps the timetable construction happy
+        // (a feed with no trips at all is rejected); the trip itself
+        // is irrelevant to the transfer-loading assertion below.
+        g.routes.insert(
+            "R".into(),
+            Route {
+                id: "R".into(),
+                ..Default::default()
+            },
+        );
+        g.trips.insert(
+            "T".into(),
+            Trip {
+                id: "T".into(),
+                service_id: "weekday".into(),
+                route_id: "R".into(),
+                stop_times: vec![
+                    StopTime {
+                        arrival_time: Some(6 * 3600),
+                        departure_time: Some(6 * 3600),
+                        stop: Arc::clone(&stop_a),
+                        ..Default::default()
+                    },
+                    StopTime {
+                        arrival_time: Some(6 * 3600 + 600),
+                        departure_time: Some(6 * 3600 + 600),
+                        stop: Arc::clone(&stop_b),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            },
+        );
+
+        let tt = GtfsTimetable::new(&g, ymd_jiff(2026, 5, 4)).unwrap();
+        let a = tt.stop_idx("A").unwrap();
+        let b = tt.stop_idx("B").unwrap();
+        let c = tt.stop_idx("C").unwrap();
+
+        let footpaths = tt.get_footpaths_from(a);
+        assert!(
+            footpaths.contains(&b),
+            "Recommended transfer A->B must create a footpath, got {:?}",
+            footpaths,
+        );
+        assert!(
+            !footpaths.contains(&c),
+            "Impossible (transfer_type=3) A->C must not create a footpath, got {:?}",
+            footpaths,
+        );
+    }
+
+    /// Stops S, M, T are colinear at the equator with neighbour spacing
+    /// 400 m and end-to-end spacing 800 m. With a 500 m cap, the R-tree
+    /// adds S↔M and M↔T but not S↔T, and the resulting timetable must
+    /// report itself transitively closed so the runtime walks each
+    /// source's labels once and never stitches the 800 m chain together.
+    #[test]
+    fn with_walking_footpaths_caps_per_leg_and_marks_closed() {
+        use gtfs_structures::{Route, Stop, Trip};
+        use std::sync::Arc;
+
+        let mut g = weekday_only_feed();
+
+        // 1 deg latitude ≈ 111 320 m at the equator. 400 m → 0.0035929 deg.
+        const STEP_DEG: f64 = 400.0 / 111_320.0;
+
+        let stop = |id: &str, lat: f64| {
+            Arc::new(Stop {
+                id: id.into(),
+                latitude: Some(lat),
+                longitude: Some(0.0),
+                ..Default::default()
+            })
+        };
+        let stop_s = stop("S", 0.0);
+        let stop_m = stop("M", STEP_DEG);
+        let stop_t = stop("T", 2.0 * STEP_DEG);
+        g.stops.insert("S".into(), Arc::clone(&stop_s));
+        g.stops.insert("M".into(), Arc::clone(&stop_m));
+        g.stops.insert("T".into(), Arc::clone(&stop_t));
+
+        // Trivial trip so the timetable construction has at least one
+        // service to attach the stops to; routing isn't exercised here.
+        g.routes.insert(
+            "R".into(),
+            Route {
+                id: "R".into(),
+                ..Default::default()
+            },
+        );
+        g.trips.insert(
+            "T1".into(),
+            Trip {
+                id: "T1".into(),
+                service_id: "weekday".into(),
+                route_id: "R".into(),
+                stop_times: vec![
+                    StopTime {
+                        arrival_time: Some(6 * 3600),
+                        departure_time: Some(6 * 3600),
+                        stop: Arc::clone(&stop_s),
+                        ..Default::default()
+                    },
+                    StopTime {
+                        arrival_time: Some(6 * 3600 + 600),
+                        departure_time: Some(6 * 3600 + 600),
+                        stop: Arc::clone(&stop_m),
+                        ..Default::default()
+                    },
+                    StopTime {
+                        arrival_time: Some(6 * 3600 + 1200),
+                        departure_time: Some(6 * 3600 + 1200),
+                        stop: Arc::clone(&stop_t),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            },
+        );
+
+        let tt = GtfsTimetable::new(&g, ymd_jiff(2026, 5, 4))
+            .unwrap()
+            .with_walking_footpaths(&g, 500.0, 1.4);
+
+        assert!(
+            tt.footpaths_are_transitively_closed(),
+            "with_walking_footpaths must mark the relation closed so the \
+             runtime caps walking at one hop per round",
+        );
+
+        let s = tt.stop_idx("S").unwrap();
+        let m = tt.stop_idx("M").unwrap();
+        let t = tt.stop_idx("T").unwrap();
+
+        let from_s = tt.get_footpaths_from(s);
+        assert!(
+            from_s.contains(&m),
+            "S→M (400 m) must be a direct footpath, got {:?}",
+            from_s,
+        );
+        assert!(
+            !from_s.contains(&t),
+            "S→T (800 m) must not be a direct footpath at cap=500 m, got {:?}",
+            from_s,
+        );
+
+        let from_m = tt.get_footpaths_from(m);
+        assert!(
+            from_m.contains(&s) && from_m.contains(&t),
+            "M is within 400 m of both S and T, got {:?}",
+            from_m,
+        );
+    }
+
+    /// `features()` must report the input-derived counts (stops with
+    /// coords, parent stations, transfer-type breakdown, shaped trips)
+    /// and reflect the dynamic state correctly before and after
+    /// `with_walking_footpaths`.
+    #[test]
+    fn features_reports_input_counts_and_dynamic_state() {
+        use gtfs_structures::{LocationType, Route, Shape, Stop, StopTransfer, TransferType, Trip};
+        use std::sync::Arc;
+
+        let mut g = weekday_only_feed();
+
+        let stop_parent = Arc::new(Stop {
+            id: "P".into(),
+            location_type: LocationType::StopArea,
+            latitude: Some(0.0),
+            longitude: Some(0.0),
+            ..Default::default()
+        });
+        // Two boardable platforms with coordinates ~400 m apart;
+        // one is wheelchair-inaccessible, the other has no coords
+        // at all.
+        let stop_a = Arc::new(Stop {
+            id: "A".into(),
+            parent_station: Some("P".into()),
+            latitude: Some(0.0),
+            longitude: Some(0.0),
+            wheelchair_boarding: Availability::NotAvailable,
+            transfers: vec![
+                StopTransfer {
+                    to_stop_id: "B".into(),
+                    transfer_type: TransferType::Recommended,
+                    min_transfer_time: Some(60),
+                },
+                StopTransfer {
+                    to_stop_id: "C".into(),
+                    transfer_type: TransferType::Impossible,
+                    min_transfer_time: None,
+                },
+            ],
+            ..Default::default()
+        });
+        let stop_b = Arc::new(Stop {
+            id: "B".into(),
+            parent_station: Some("P".into()),
+            latitude: Some(400.0 / 111_320.0),
+            longitude: Some(0.0),
+            ..Default::default()
+        });
+        let stop_c = Arc::new(Stop {
+            id: "C".into(),
+            // intentionally no coords – exercises n_stops_with_coords.
+            ..Default::default()
+        });
+        g.stops.insert("P".into(), Arc::clone(&stop_parent));
+        g.stops.insert("A".into(), Arc::clone(&stop_a));
+        g.stops.insert("B".into(), Arc::clone(&stop_b));
+        g.stops.insert("C".into(), Arc::clone(&stop_c));
+
+        // Shape that the trip below references; counts toward
+        // `n_trips_with_shapes`.
+        g.shapes.insert(
+            "shape-1".into(),
+            vec![
+                Shape {
+                    id: "shape-1".into(),
+                    latitude: 0.0,
+                    longitude: 0.0,
+                    sequence: 0,
+                    dist_traveled: Some(0.0),
+                },
+                Shape {
+                    id: "shape-1".into(),
+                    latitude: 400.0 / 111_320.0,
+                    longitude: 0.0,
+                    sequence: 1,
+                    dist_traveled: Some(400.0),
+                },
+            ],
+        );
+
+        g.routes.insert(
+            "R".into(),
+            Route {
+                id: "R".into(),
+                ..Default::default()
+            },
+        );
+        // Trip on R with a shape; second trip without a shape and with
+        // wheelchair_accessible = NotAvailable to exercise inaccessible
+        // counts.
+        g.trips.insert(
+            "T1".into(),
+            Trip {
+                id: "T1".into(),
+                service_id: "weekday".into(),
+                route_id: "R".into(),
+                shape_id: Some("shape-1".into()),
+                stop_times: vec![
+                    StopTime {
+                        arrival_time: Some(6 * 3600),
+                        departure_time: Some(6 * 3600),
+                        stop: Arc::clone(&stop_a),
+                        ..Default::default()
+                    },
+                    StopTime {
+                        arrival_time: Some(6 * 3600 + 600),
+                        departure_time: Some(6 * 3600 + 600),
+                        stop: Arc::clone(&stop_b),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            },
+        );
+        g.trips.insert(
+            "T2".into(),
+            Trip {
+                id: "T2".into(),
+                service_id: "weekday".into(),
+                route_id: "R".into(),
+                wheelchair_accessible: Availability::NotAvailable,
+                stop_times: vec![
+                    StopTime {
+                        arrival_time: Some(7 * 3600),
+                        departure_time: Some(7 * 3600),
+                        stop: Arc::clone(&stop_a),
+                        ..Default::default()
+                    },
+                    StopTime {
+                        arrival_time: Some(7 * 3600 + 600),
+                        departure_time: Some(7 * 3600 + 600),
+                        stop: Arc::clone(&stop_b),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            },
+        );
+
+        let tt = GtfsTimetable::new(&g, ymd_jiff(2026, 5, 4)).unwrap();
+        let f = tt.features();
+
+        assert_eq!(f.n_stops, 4, "P, A, B, C");
+        assert_eq!(f.n_stops_with_coords, 3, "P, A, B have coords; C does not");
+        assert_eq!(f.n_parent_stations, 1, "P");
+        assert_eq!(f.n_inaccessible_stops, 1, "A");
+        assert_eq!(f.n_trips, 2);
+        assert_eq!(f.n_inaccessible_trips, 1);
+        assert_eq!(f.n_trips_with_shapes, 1);
+        assert_eq!(f.transfers_by_type.recommended, 1);
+        assert_eq!(f.transfers_by_type.impossible, 1);
+        assert_eq!(f.transfers_by_type.total(), 2);
+        assert_eq!(f.transfers_by_type.loaded(), 1);
+        assert!(!f.walking_footpaths_added);
+        assert!(!f.footpaths_closed);
+        // One footpath: the Recommended A→B; Impossible was filtered.
+        assert_eq!(f.n_footpaths, 1);
+
+        let tt = tt.with_walking_footpaths(&g, 500.0, 1.4);
+        let f = tt.features();
+        assert!(f.walking_footpaths_added);
+        assert!(f.footpaths_closed);
+        // After R-tree augmentation, A↔B is still a single edge in
+        // each direction (the publisher entry preempted the R-tree
+        // entry one way); P is also within 400 m of A and B so it
+        // gains edges. The exact count depends on which pairs the
+        // R-tree picks up, but it must strictly exceed the baseline.
+        assert!(
+            f.n_footpaths > 1,
+            "with_walking_footpaths should add edges, got {}",
+            f.n_footpaths,
+        );
+    }
+
+    fn contains_substr(needle: &str, haystack: &[&'static str]) -> bool {
+        haystack.iter().any(|s| s.contains(needle))
+    }
+
+    #[test]
+    fn suggestions_advise_walking_footpaths_when_transfers_empty() {
+        let f = FeedFeatures {
+            n_stops: 100,
+            n_stops_with_coords: 100,
+            ..Default::default()
+        };
+        let s = f.suggestions();
+        assert!(contains_substr("with_walking_footpaths", &s), "got {:?}", s);
+        assert!(
+            !contains_substr("assert_footpaths_closed", &s),
+            "got {:?}",
+            s
+        );
+    }
+
+    #[test]
+    fn suggestions_skip_walking_footpaths_when_no_coords_available() {
+        let f = FeedFeatures {
+            n_stops: 100,
+            n_stops_with_coords: 0,
+            ..Default::default()
+        };
+        let s = f.suggestions();
+        assert!(
+            !contains_substr("with_walking_footpaths", &s),
+            "got {:?}",
+            s,
+        );
+    }
+
+    #[test]
+    fn suggestions_advise_assert_closed_when_transfers_present_and_open() {
+        let f = FeedFeatures {
+            n_stops: 100,
+            transfers_by_type: TransfersByType {
+                recommended: 50,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let s = f.suggestions();
+        assert!(
+            contains_substr("assert_footpaths_closed", &s),
+            "got {:?}",
+            s
+        );
+    }
+
+    #[test]
+    fn suggestions_skip_assert_closed_when_already_closed_or_walking_added() {
+        let base = FeedFeatures {
+            n_stops: 100,
+            transfers_by_type: TransfersByType {
+                recommended: 50,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let s = FeedFeatures {
+            footpaths_closed: true,
+            ..base.clone()
+        }
+        .suggestions();
+        assert!(
+            !contains_substr("assert_footpaths_closed", &s),
+            "got {:?}",
+            s,
+        );
+        let s = FeedFeatures {
+            walking_footpaths_added: true,
+            ..base
+        }
+        .suggestions();
+        assert!(
+            !contains_substr("assert_footpaths_closed", &s),
+            "got {:?}",
+            s,
+        );
+    }
+
+    #[test]
+    fn suggestions_call_out_parent_stations_shapes_and_wheelchair_flags() {
+        let f = FeedFeatures {
+            n_stops: 100,
+            n_parent_stations: 3,
+            n_trips_with_shapes: 50,
+            n_inaccessible_trips: 1,
+            ..Default::default()
+        };
+        let s = f.suggestions();
+        assert!(contains_substr("station_stops", &s), "got {:?}", s);
+        assert!(contains_substr("shape_for_leg", &s), "got {:?}", s);
+        assert!(
+            contains_substr("require_wheelchair_accessible", &s),
+            "got {:?}",
+            s,
+        );
+    }
+
+    #[test]
+    fn suggestions_empty_when_feed_is_in_happy_state() {
+        let f = FeedFeatures {
+            n_stops: 100,
+            n_stops_with_coords: 100,
+            transfers_by_type: TransfersByType {
+                recommended: 50,
+                ..Default::default()
+            },
+            footpaths_closed: true,
+            ..Default::default()
+        };
+        assert!(f.suggestions().is_empty(), "got {:?}", f.suggestions());
+    }
+}
