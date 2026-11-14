@@ -14,8 +14,9 @@ replacement for [MOTIS](https://github.com/motis-project/motis) where RAM is sca
 * **Self-updating:** `rustis update` downloads changed feeds (conditional GET), rebuilds
   the snapshot in parallel, publishes it atomically and the server hot-reloads it.
 
-> Status: early. The MOTIS-compatible API (`/api/v6/plan`, `/api/v6/map/stops`) is in
-> progress; the native API below is stable.
+> Status: early. The MOTIS-compatible subset (`/api/v6/plan` GET/POST incl. offsets,
+> `radius`, `transitModes`, and `/api/v6/map/stops`) is contract-tested against MOTIS
+> 2.11; other MOTIS endpoints are not provided.
 
 ## Commands
 
@@ -76,6 +77,19 @@ POST /v1/plan
   e.g. feeds not imported, Flex, unexploited transfer rules, search limit reached).
 * Per-request bounds: ≤ 64 origin/destination stops, `max_transfers` ≤ 8,
   `max_results` ≤ 10, `max_travel_seconds` ≤ 4 days; `503` when all query slots are busy.
+
+## Container
+
+```sh
+docker build -t rustis .
+# serve: /data/current is the snapshot symlink, reloaded every 60 s
+docker run -d -p 127.0.0.1:8080:8080 -v /srv/rustis:/data -v ./config.yml:/config/motis-config.yml:ro rustis
+# daily refresh inside the running container (downloads changed feeds, publishes, hot reload)
+docker exec <container> rustis update --root /data --motis-config /config/motis-config.yml --jobs 1
+```
+
+Serving stays well below 512 MiB; a full rebuild of all of Europe peaks at about 4.5 GiB,
+so the container limit has to cover the update run, not the server.
 
 ## Architecture
 
