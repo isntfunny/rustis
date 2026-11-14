@@ -31,7 +31,10 @@ pub const FLAG_DROP_OFF_BOOKING: u8 = 8;
 /// Change time value meaning "no transfer possible at this stop" (type 3).
 pub const FORBIDDEN: u32 = u32::MAX;
 pub const NONE: u32 = u32::MAX;
-pub const SNAPSHOT_VERSION: u32 = 4;
+pub const SNAPSHOT_VERSION: u32 = 5;
+/// Bit set in `foot_secs` for footpaths given explicitly by transfers.txt
+/// (the walk is not raised to the change time of the stop it starts at).
+pub const FOOT_EXPLICIT: u32 = 1 << 31;
 
 #[derive(Clone, Debug)]
 pub struct BuildOptions {
@@ -1403,6 +1406,7 @@ impl Builder {
                 .collect();
             explicit.extend(rev);
         }
+        let explicit_pairs: HashSet<(u32, u32)> = explicit.iter().map(|e| (e.0, e.1)).collect();
         let foot = close_footpaths(
             n_stops,
             &served,
@@ -1422,7 +1426,16 @@ impl Builder {
         write_all(
             &dir,
             "foot_secs",
-            &foot.iter().map(|e| e.2).collect::<Vec<_>>(),
+            &foot
+                .iter()
+                .map(|e| {
+                    if explicit_pairs.contains(&(e.0, e.1)) {
+                        e.2 | FOOT_EXPLICIT
+                    } else {
+                        e.2
+                    }
+                })
+                .collect::<Vec<_>>(),
             m,
         )?;
         let n_footpaths = foot.len();

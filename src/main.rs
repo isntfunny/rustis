@@ -21,15 +21,17 @@ struct BuildArgs {
     first_day: Option<String>,
     #[arg(long, default_value_t = 366)]
     horizon_days: u32,
-    /// Generate footpaths between stops closer than this (0 = off).
-    #[arg(long, default_value_t = 0.0)]
+    /// Generate footpaths between stops closer than this (0 = off); longer
+    /// walks are chained over intermediate stops up to --max-footpath-secs.
+    #[arg(long, default_value_t = 300.0)]
     link_radius_m: f64,
     #[arg(long, default_value_t = 1.2)]
     walk_speed: f64,
     #[arg(long, default_value_t = 720)]
     max_footpath_secs: u32,
-    /// Minimum change time (s) at stops without a same-stop transfers.txt rule.
-    #[arg(long, default_value_t = 0)]
+    /// Minimum change time (s) at stops without a same-stop transfers.txt
+    /// rule; walking on to another stop takes at least this long, too.
+    #[arg(long, default_value_t = 120)]
     default_change_seconds: u32,
     /// Treat pickup/drop_off 2/3 (booking) as not available.
     #[arg(long)]

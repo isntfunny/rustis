@@ -225,9 +225,19 @@ struct Search<'t, 'q, 'l> {
     lb: &'l mut LowerBound<'t>,
     bound: u32,
     inserted: usize,
-    /// Best target arrival per round: (arrival, target stop, label kind).
-    best_target: Vec<Option<(u32, u32, From)>>,
+    /// Best target arrival per round: (arrival, target stop, label kind,
+    /// final walk (from stop, secs) after a ride – `NONE` otherwise).
+    best_target: Vec<Option<Target>>,
     stats: SearchStats,
+}
+
+#[derive(Clone, Copy)]
+struct Target {
+    arr: u32,
+    stop: u32,
+    kind: From,
+    walk_from: u32,
+    walk_secs: u32,
 }
 
 /// One RAPTOR search; `lb` must have been created for `q.targets`.
@@ -258,11 +268,11 @@ pub fn search<'t>(
     let mut out = Vec::new();
     let mut prev = u32::MAX;
     for k in 0..s.best_target.len() {
-        if let Some((arr, t, kind)) = s.best_target[k]
-            && arr < prev
+        if let Some(t) = s.best_target[k]
+            && t.arr < prev
         {
-            prev = arr;
-            if let Some(j) = s.reconstruct(k, t, kind, arr) {
+            prev = t.arr;
+            if let Some(j) = s.reconstruct(k, t) {
                 out.push(j);
             }
         }
@@ -273,10 +283,31 @@ pub fn search<'t>(
 
 impl Search<'_, '_, '_> {
     fn note_target(&mut self, k: usize, stop: u32, arr: u32, kind: From) {
+        self.note_target_walk(k, stop, arr, kind, NONE, 0);
+    }
+
+    /// `walk_from`/`walk_secs`: the target is reached on foot from the ride
+    /// label at `walk_from` (its walk label may hold another, better-for-
+    /// boarding path, so the walk is recorded here).
+    fn note_target_walk(
+        &mut self,
+        k: usize,
+        stop: u32,
+        arr: u32,
+        kind: From,
+        walk_from: u32,
+        walk_secs: u32,
+    ) {
         if let Some(&w) = self.targets.get(&stop) {
             let a = arr.saturating_add(w);
-            if a < self.bound && self.best_target[k].is_none_or(|b| a < b.0) {
-                self.best_target[k] = Some((a, stop, kind));
+            if a < self.bound && self.best_target[k].is_none_or(|b| a < b.arr) {
+                self.best_target[k] = Some(Target {
+                    arr: a,
+                    stop,
+                    kind,
+                    walk_from,
+                    walk_secs,
+                });
                 self.bound = a;
             }
         }
@@ -379,8 +410,20 @@ impl Search<'_, '_, '_> {
                         next.push(s);
                     }
                 }
-                for (u, secs) in tt.footpaths(s) {
-                    let t = l.arr.saturating_add(secs);
+                // Leaving the stop on foot to board elsewhere takes at least
+                // the stop's change time (as nigiri does) unless transfers.txt
+                // gives this very pair; arriving at a target only takes the walk.
+                let floor = if ct == FORBIDDEN { 0 } else { ct };
+                for (u, secs, explicit) in tt.footpaths_flagged(s) {
+                    let on_foot = l.arr.saturating_add(secs);
+                    if self.targets.contains_key(&u) {
+                        self.note_target_walk(k, u, on_foot, From::Walk, s, secs);
+                    }
+                    let t = if explicit {
+                        on_foot
+                    } else {
+                        l.arr.saturating_add(secs.max(floor))
+                    };
                     if self.best_ready.get(u).is_none_or(|b| t < b) && !self.pruned(u, t) {
                         self.inserted += 1;
                         self.walk[k].insert(
@@ -393,7 +436,6 @@ impl Search<'_, '_, '_> {
                         );
                         self.best_ready.set(u, t);
                         next.push(u);
-                        self.note_target(k, u, t, From::Walk);
                     }
                 }
             }
@@ -590,12 +632,22 @@ impl Search<'_, '_, '_> {
         best
     }
 
-    fn reconstruct(&self, k: usize, target: u32, kind: From, arrival: u32) -> Option<Journey> {
+    fn reconstruct(&self, k: usize, t: Target) -> Option<Journey> {
+        let (target, arrival) = (t.stop, t.arr);
         let mut steps = vec![Step::Egress {
             stop: target,
             secs: self.targets[&target],
         }];
-        let (mut k, mut stop, mut kind) = (k, target, kind);
+        let (mut k, mut stop, mut kind) = (k, target, t.kind);
+        if t.walk_from != NONE {
+            steps.push(Step::Walk {
+                from: t.walk_from,
+                to: target,
+                secs: t.walk_secs,
+            });
+            stop = t.walk_from;
+            kind = From::Ride;
+        }
         loop {
             match kind {
                 From::Walk => {

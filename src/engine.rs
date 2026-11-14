@@ -725,6 +725,47 @@ impl Snapshot {
     }
 
     /// Warnings attached to every response (known coverage/semantic limits).
+    /// Diagnostics: what Rustis requires to change from stop `from` to stop
+    /// `to` (same-stop change time, direct footpath, specific rules).
+    pub fn transfer_info(&self, from: &str, to: &str) -> Result<serde_json::Value, Error> {
+        let tt = &self.tt;
+        let a = tt
+            .catalog
+            .lookup(from)
+            .ok_or_else(|| Error::invalid(format!("unknown stop {from}")))?;
+        let b = tt
+            .catalog
+            .lookup(to)
+            .ok_or_else(|| Error::invalid(format!("unknown stop {to}")))?;
+        let secs = |x: u32| if x == build::FORBIDDEN { None } else { Some(x) };
+        let foot = tt.footpaths_flagged(a as u32).find(|f| f.0 as usize == b);
+        let name =
+            |i: u32, s: &crate::tt::Strs| (i != build::NONE).then(|| s.get(i as usize).to_owned());
+        let rules: Vec<serde_json::Value> = (tt.rule_off[b] as usize..tt.rule_off[b + 1] as usize)
+            .filter(|&i| tt.rule_from_stop[i] as usize == a)
+            .map(|i| {
+                serde_json::json!({
+                    "secs": secs(tt.rule_secs[i]),
+                    "from_trip": name(tt.rule_from_trip[i], &tt.gtfs_trip_id),
+                    "to_trip": name(tt.rule_to_trip[i], &tt.gtfs_trip_id),
+                    "from_route": name(tt.rule_from_route[i], &tt.route_info_id),
+                    "to_route": name(tt.rule_to_route[i], &tt.route_info_id),
+                })
+            })
+            .take(50)
+            .collect();
+        Ok(serde_json::json!({
+            "from": from,
+            "to": to,
+            "same_stop": a == b,
+            "change_secs_at_from": secs(tt.stop_change[a]),
+            "change_secs_at_to": secs(tt.stop_change[b]),
+            "footpath_secs": foot.map(|f| f.1),
+            "footpath_explicit": foot.map(|f| f.2),
+            "specific_rules": rules,
+        }))
+    }
+
     /// Snapshot directory.
     pub fn dir(&self) -> &Path {
         &self.tt.dir

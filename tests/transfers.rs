@@ -405,3 +405,67 @@ fn stay_seated_continuations_skip_the_change_time() {
     let (_t, s) = import(&format!("{h}B,B,2,600,,\nB,B,4,,T1,T3\n"), &opts());
     assert_eq!(trips(&plan(&s))[0], ["T1", "T3"]);
 }
+
+/// Generated walks (link radius) after a ride take at least the change time
+/// of the stop alighted at; an explicit transfers.txt pair keeps its own
+/// time; a destination reached on foot is not delayed (B→D ≈ 133 m ≈ 111 s).
+#[test]
+fn generated_walks_take_at_least_the_change_time_of_the_alighting_stop() {
+    let mut o = opts();
+    o.link_radius_m = 200.0;
+    // B change time 300 s: walk ready at D 08:15:00 = T2's departure → ok.
+    let (_t, s) = import(&format!("{HEADER}B,B,2,300\n"), &o);
+    assert_eq!(trips(&plan(&s))[0], ["T1", "T2"]);
+    // 360 s: ready 08:16 > 08:15 → neither T3 nor T2; the slow direct trip.
+    let (_t, s) = import(&format!("{HEADER}B,B,2,360\n"), &o);
+    let r = plan(&s);
+    assert!(
+        trips(&r)
+            .iter()
+            .all(|t| t != &["T1", "T2"] && t != &["T1", "T3"]),
+        "{:?}",
+        trips(&r)
+    );
+    assert_eq!(trips(&r)[0], ["SLOW"]);
+    // An explicit B→D pair (120 s) is the operator's statement for exactly
+    // this change and wins over B's same-stop time.
+    let (_t, s) = import(&format!("{HEADER}B,B,2,360\nB,D,2,120\n"), &o);
+    assert_eq!(trips(&plan(&s))[0], ["T1", "T2"]);
+    // The default change time applies to generated walks, too.
+    o.default_change_seconds = 299;
+    let (_t, s) = import(HEADER, &o);
+    assert!(trips(&plan(&s)).iter().any(|t| t == &["T1", "T2"]));
+    o.default_change_seconds = 301;
+    let (_t, s) = import(HEADER, &o);
+    assert!(trips(&plan(&s)).iter().all(|t| t != &["T1", "T2"]));
+    // Walking to the destination D after T1 is not delayed by B's 360 s.
+    let mut o = opts();
+    o.link_radius_m = 200.0;
+    let (_t, s) = import(&format!("{HEADER}B,B,2,360\n"), &o);
+    let r = s
+        .plan(&PlanRequest {
+            date: "2026-11-16".into(),
+            departure: H8,
+            from: vec![Endpoint {
+                stop_id: "A".into(),
+                walk_seconds: 0,
+            }],
+            to: vec![Endpoint {
+                stop_id: "D".into(),
+                walk_seconds: 0,
+            }],
+            max_transfers: 3,
+            max_results: 1,
+            max_travel_seconds: 86_400,
+            alternatives_within_seconds: 0,
+        })
+        .unwrap();
+    let it = &r.itineraries[0];
+    assert_eq!(trips(&r)[0], ["T1"]);
+    assert!(
+        it.arrival < H8 + 600 + 120,
+        "arrival {} includes the change time",
+        it.arrival - H8
+    );
+    assert_eq!(it.legs.last().unwrap().kind, LegKind::Walk);
+}

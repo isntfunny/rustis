@@ -3,7 +3,7 @@
 //! All large arrays are memory-mapped (page cache, evictable); only the
 //! per-(time zone, day) UTC base table is computed into the heap at open
 //! (timezones × days × 8 B).
-use crate::build::{SNAPSHOT_VERSION, SnapshotMeta, noon_minus_12h};
+use crate::build::{FOOT_EXPLICIT, SNAPSHOT_VERSION, SnapshotMeta, noon_minus_12h};
 use crate::catalog::Catalog;
 use crate::store::Array;
 use anyhow::{Context, Result, ensure};
@@ -308,6 +308,11 @@ impl Timetable {
         self.stop_route_off[s + 1] > self.stop_route_off[s]
     }
     pub fn footpaths(&self, s: u32) -> impl Iterator<Item = (u32, u32)> + '_ {
+        self.footpaths_flagged(s).map(|(t, secs, _)| (t, secs))
+    }
+
+    /// Footpaths with their transfers.txt origin (`true` = explicit pair).
+    pub fn footpaths_flagged(&self, s: u32) -> impl Iterator<Item = (u32, u32, bool)> + '_ {
         let (a, b) = (
             self.foot_off[s as usize] as usize,
             self.foot_off[s as usize + 1] as usize,
@@ -316,5 +321,6 @@ impl Timetable {
             .iter()
             .copied()
             .zip(self.foot_secs[a..b].iter().copied())
+            .map(|(t, x)| (t, x & !FOOT_EXPLICIT, x & FOOT_EXPLICIT != 0))
     }
 }

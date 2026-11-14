@@ -120,6 +120,7 @@ pub fn router_with(handle: Arc<SnapshotHandle>, max_concurrency: usize) -> Route
     Router::new()
         .route("/health", get(health))
         .route("/v1/feeds", get(feeds))
+        .route("/v1/debug/transfer", get(transfer))
         .route("/v1/stats", get(stats))
         .route("/v1/stops", get(stops))
         .route("/v1/plan", post(plan))
@@ -157,6 +158,19 @@ async fn health(State(s): State<AppState>) -> Response {
 
 async fn feeds(State(s): State<AppState>) -> Response {
     Json(json!({ "feeds": s.handle.get().feeds() })).into_response()
+}
+
+#[derive(Deserialize)]
+struct TransferQuery {
+    from: String,
+    to: String,
+}
+
+async fn transfer(State(s): State<AppState>, Query(q): Query<TransferQuery>) -> Response {
+    match s.handle.get().transfer_info(&q.from, &q.to) {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => e.into_response(),
+    }
 }
 
 async fn stats(State(s): State<AppState>) -> Response {
