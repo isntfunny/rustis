@@ -168,6 +168,8 @@ pub(crate) struct Metadata {
     /// rules were dropped (results valid, possibly incomplete).
     pub transfer_mode: String,
     pub dropped_transfer_rules: std::collections::BTreeMap<String, usize>,
+    #[serde(default)]
+    pub excluded_trips: std::collections::BTreeMap<String, usize>,
     pub default_change_seconds: u32,
     pub stops: Vec<Stop>,
     pub routes: Vec<RouteInfo>,

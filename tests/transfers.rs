@@ -350,3 +350,64 @@ fn reported_arrivals_exclude_the_internal_change_time() {
     assert_eq!(r.itineraries[0].arrival, H8 + 20 * 60);
     assert_eq!(r.itineraries[0].arrival_time, "2026-11-16T08:20:00+01:00");
 }
+
+fn generalize() -> ImportOptions {
+    let mut o = opts();
+    o.generalize_restricting_transfers = true;
+    o
+}
+
+const SPECIFIC: &str = "from_stop_id,to_stop_id,transfer_type,min_transfer_time,from_trip_id,to_trip_id,from_route_id,to_route_id\n";
+
+#[test]
+fn generalized_route_specific_same_stop_time_applies_to_every_change() {
+    // Only R1→R3 needs 300 s at B; generalised to every change at B.
+    let (_t, s) = import(&format!("{SPECIFIC}B,B,2,300,,,R1,R3\n"), &generalize());
+    let r = plan(&s);
+    assert_eq!(trips(&r), [["SLOW"]]);
+    assert!(
+        r.warnings.iter().any(|w| w.contains("generalised")),
+        "{:?}",
+        r.warnings
+    );
+    assert_changes_valid(&r, |s| if s == "B" { 300 } else { 0 }, |_, _| None);
+    // A more permissive specific time never lowers a stop-level rule.
+    let (_t, s) = import(
+        &format!("{SPECIFIC}B,B,2,300,,,,\nB,B,2,60,,,R1,R3\n"),
+        &generalize(),
+    );
+    assert_eq!(trips(&plan(&s)), [["SLOW"]]);
+}
+
+#[test]
+fn generalized_specific_walk_time_only_tightens_existing_footpaths() {
+    // Stop-level B→D 120 s raised to 600 s: T2 (08:15) no longer reachable.
+    let (_t, s) = import(
+        &format!("{SPECIFIC}B,D,2,120,,,,\nB,D,2,600,,,R1,R2\nC,C,2,600,,,,\n"),
+        &generalize(),
+    );
+    let r = plan(&s);
+    assert!(
+        !trips(&r).contains(&vec!["T1".into(), "T2".into()]),
+        "{:?}",
+        trips(&r)
+    );
+    // Without a stop-level footpath the specific row creates none.
+    let (_t, s) = import(
+        &format!("{SPECIFIC}B,D,2,60,,,R1,R2\nB,B,2,600,,,,\n"),
+        &generalize(),
+    );
+    assert_eq!(trips(&plan(&s)), [["SLOW"]]);
+}
+
+#[test]
+fn generalized_specific_forbidden_transfer_removes_the_footpath() {
+    let (_t, s) = import(
+        &format!("{SPECIFIC}B,D,2,120,,,,\nB,D,3,,T1,T2,,\nB,B,2,600,,,,\n"),
+        &generalize(),
+    );
+    assert_eq!(trips(&plan(&s)), [["SLOW"]]);
+    // Same-stop specific prohibition still cannot be enforced.
+    let e = import_err(&format!("{SPECIFIC}B,B,3,,,,R1,R3\n"), &generalize());
+    assert!(e.contains("cannot be enforced"), "{e}");
+}

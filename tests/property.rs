@@ -301,22 +301,32 @@ fn run(with_change_times: bool, seeds: std::ops::Range<u64>) -> (usize, usize, u
                 for depart in [8 * 3600, 8 * 3600 + 1200] {
                     queries += 1;
                     let ctx = format!("seed {seed} S{from}->S{to} @{depart}");
-                    let r = snap
-                        .plan(&PlanRequest {
-                            date: "2026-11-16".into(),
-                            departure: depart,
-                            from: vec![Endpoint {
-                                stop_id: format!("S{from}"),
-                                walk_seconds: 0,
-                            }],
-                            to: vec![Endpoint {
-                                stop_id: format!("S{to}"),
-                                walk_seconds: 0,
-                            }],
-                            max_transfers: 8,
-                            max_results: 10,
-                        })
-                        .unwrap();
+                    let r = snap.plan(&PlanRequest {
+                        date: "2026-11-16".into(),
+                        departure: depart,
+                        from: vec![Endpoint {
+                            stop_id: format!("S{from}"),
+                            walk_seconds: 0,
+                        }],
+                        to: vec![Endpoint {
+                            stop_id: format!("S{to}"),
+                            walk_seconds: 0,
+                        }],
+                        max_transfers: 8,
+                        max_results: 10,
+                    });
+                    // The prefilter drops stops no trip serves on the snapshot days.
+                    let r = match r {
+                        Ok(r) => r,
+                        Err(e) if e.to_string().contains("not served") => {
+                            assert!(
+                                brute_force(&net, from, to, depart).is_none_or(|t| t.is_none()),
+                                "{ctx}: {e}"
+                            );
+                            continue;
+                        }
+                        Err(e) => panic!("{ctx}: {e}"),
+                    };
                     assert_eq!(r.omitted_unreconstructable, 0, "{ctx}");
                     for it in &r.itineraries {
                         check(&net, it, depart, &ctx);

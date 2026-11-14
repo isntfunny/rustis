@@ -195,6 +195,26 @@ pub fn le_u64(b: &[u8], at: usize) -> u64 {
     u64::from_le_bytes(b[at..at + 8].try_into().expect("8-byte slice"))
 }
 
+/// Streaming FNV-1a 64 (same result as [`fnv64`]).
+pub struct Fnv64(pub u64);
+impl Default for Fnv64 {
+    fn default() -> Self {
+        Self(0xcbf2_9ce4_8422_2325)
+    }
+}
+impl std::io::Write for Fnv64 {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        for &b in buf {
+            self.0 ^= u64::from(b);
+            self.0 = self.0.wrapping_mul(0x0100_0000_01b3);
+        }
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 /// FNV-1a 64-bit; stable across builds, cheap, sufficient to detect accidental
 /// corruption (not tampering).
 pub fn fnv64(data: &[u8]) -> u64 {

@@ -5,7 +5,6 @@
 //! feed against the supported subset and persists the prepared timetable.
 use crate::format::{
     FLAG_DROP_OFF_BOOKING, FLAG_NO_DROP_OFF, FLAG_NO_PICKUP, FLAG_PICKUP_BOOKING, Sec, Writer,
-    fnv64,
 };
 use crate::model::{METADATA_VERSION, Metadata, RouteInfo, Stop};
 use anyhow::{Context, Result, bail, ensure};
@@ -28,11 +27,26 @@ pub struct ImportOptions {
     /// (timed/in-seat/recommended, incl. trip/route-specific ones). Rules that
     /// restrict transfers (specific min-time/forbidden) are always rejected.
     pub drop_relaxing_transfers: bool,
+    /// Apply trip/route-specific minimum-time (type 2) and forbidden (type 3)
+    /// rules to every trip at those stops: only ever tightens existing times or
+    /// removes footpaths, never creates one.
+    pub generalize_restricting_transfers: bool,
     /// Minimum change time at a stop without its own same-stop rule.
     pub default_change_seconds: u32,
     /// Treat pickup/drop_off type 2/3 (booking/arrangement) as not available
     /// instead of routing them with a `booking_required` mark.
     pub exclude_booking_stops: bool,
+    /// Stream-filter the feed to the snapshot days before parsing (lower
+    /// import RAM). Disable only for comparison.
+    pub prefilter: bool,
+    /// Remove GTFS-Flex trips (stop_times without stop_id / with pickup
+    /// windows) instead of failing; snapshot is marked incomplete.
+    pub exclude_flex_trips: bool,
+    /// Remove frequency-based trips (frequencies.txt) instead of failing.
+    pub exclude_frequency_trips: bool,
+    /// Regional partition `[min_lat, min_lon, max_lat, max_lon]`: keep only
+    /// trips serving a stop inside (complete trips, incl. stops outside).
+    pub region_bbox: Option<[f64; 4]>,
 }
 
 impl ImportOptions {
@@ -42,8 +56,13 @@ impl ImportOptions {
             walk_radius_m: None,
             walk_speed_m_per_s: 1.2,
             drop_relaxing_transfers: false,
+            generalize_restricting_transfers: false,
             default_change_seconds: 0,
             exclude_booking_stops: false,
+            prefilter: true,
+            exclude_flex_trips: false,
+            exclude_frequency_trips: false,
+            region_bbox: None,
         }
     }
 }
@@ -72,6 +91,80 @@ pub fn import_gtfs_with(input: &Path, dest: &Path, opts: &ImportOptions) -> Resu
         "destination {} already exists; snapshots are immutable",
         dest.display()
     );
+    ensure!(
+        opts.prefilter || opts.region_bbox.is_none(),
+        "--bbox requires the prefilter"
+    );
+    if let Some([a, b, c, d]) = opts.region_bbox {
+        ensure!(
+            a < c && b < d && [a, b, c, d].iter().all(|v| v.is_finite()),
+            "bbox must be min_lat,min_lon,max_lat,max_lon"
+        );
+    }
+    if !opts.prefilter {
+        return import_prepared(input, input, dest, opts, Vec::new(), BTreeMap::new());
+    }
+    let day: chrono::NaiveDate = chrono::NaiveDate::parse_from_str(&opts.date, "%Y-%m-%d")
+        .context("date must be YYYY-MM-DD")?;
+    let parent = dest
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let name = dest
+        .file_name()
+        .context("destination needs a final path component")?;
+    let work = parent.join(format!(
+        ".{}.prefilter-{}",
+        name.to_string_lossy(),
+        std::process::id()
+    ));
+    let result = crate::prefilter::prefilter(input, &work, &[day, day + chrono::Days::new(1)], opts.exclude_flex_trips,
+        opts.exclude_frequency_trips,
+        opts.region_bbox,
+    )
+        .and_then(|st| {
+            phase(&format!("prefilter done ({} stop_times kept)", st.stop_times_kept));
+            let note = format!(
+                "prefilter: kept {}/{} trips, {}/{} stop_times active on {} or the next day, {}/{} stops (served, transfer endpoints, parents); shapes dropped",
+                st.trips_kept, st.trips_total, st.stop_times_kept, st.stop_times_total, opts.date, st.stops_kept, st.stops_total
+            );
+            let mut notes = vec![note];
+            let mut excluded = BTreeMap::new();
+            if st.flex_trips_removed > 0 {
+                excluded.insert("GTFS-Flex trips".to_owned(), st.flex_trips_removed as usize);
+            }
+            if st.frequency_trips_removed > 0 {
+                excluded.insert("frequency-based trips".to_owned(), st.frequency_trips_removed as usize);
+            }
+            if let Some(b) = opts.region_bbox {
+                excluded.insert(
+                    format!("trips not serving region {b:?} (regional partition)"),
+                    (st.trips_total - st.trips_kept) as usize,
+                );
+            }
+            if !excluded.is_empty() {
+                notes.push(format!("EXCLUDED: {excluded:?}"));
+            }
+            import_prepared(&work, input, dest, opts, notes, excluded)
+        });
+    let _ = fs::remove_dir_all(&work);
+    result
+}
+
+/// Import from `input` (possibly the pre-filtered copy of `source`).
+fn import_prepared(
+    input: &Path,
+    source: &Path,
+    dest: &Path,
+    opts: &ImportOptions,
+    pre_notes: Vec<String>,
+    excluded: BTreeMap<String, usize>,
+) -> Result<ImportReport> {
+    ensure!(
+        !dest.exists(),
+        "destination {} already exists; snapshots are immutable",
+        dest.display()
+    );
     let service_date: jiff::civil::Date = opts.date.parse().context("date must be YYYY-MM-DD")?;
     if let Some(r) = opts.walk_radius_m {
         ensure!(
@@ -83,11 +176,18 @@ pub fn import_gtfs_with(input: &Path, dest: &Path, opts: &ImportOptions) -> Resu
             "walk speed must be > 0.1 m/s"
         );
     }
-    let rules = read_transfer_rules(input, opts.drop_relaxing_transfers)?;
-    let mut notes = rules.notes.clone();
+    let mut rules = read_transfer_rules(
+        input,
+        opts.drop_relaxing_transfers,
+        opts.generalize_restricting_transfers,
+    )?;
+    rules.excluded_trips = excluded;
+    let mut notes = pre_notes;
+    notes.extend(rules.notes.clone());
 
     let mut gtfs = Gtfs::new(input.to_str().context("GTFS path must be UTF-8")?)
         .with_context(|| format!("reading GTFS {}", input.display()))?;
+    phase("gtfs parsed");
     apply_transfer_rules(&mut gtfs, &rules)?;
     let timezone = single_timezone(&gtfs)?;
     reject_dst_window(&timezone, &opts.date)?;
@@ -132,14 +232,18 @@ pub fn import_gtfs_with(input: &Path, dest: &Path, opts: &ImportOptions) -> Resu
         name.to_string_lossy(),
         std::process::id()
     ));
+    phase("vulture timetable built");
+    let ex = extract(&gtfs, &tt, timezone.clone());
+    drop(gtfs);
+    phase("gtfs graph released");
     fs::create_dir(&staging).with_context(|| format!("creating {}", staging.display()))?;
     let result = (|| {
         let report = write_snapshot(
-            &gtfs,
+            &ex,
             &tt,
             &staging,
             opts,
-            &input.display().to_string(),
+            &source.display().to_string(),
             notes,
             &rules,
         )?;
@@ -159,21 +263,103 @@ pub fn import_gtfs_with(input: &Path, dest: &Path, opts: &ImportOptions) -> Resu
     result
 }
 
+/// Import progress with current/peak RSS on stderr (import memory is the
+/// limiting resource for large feeds).
+fn phase(name: &str) {
+    if let Some(m) = crate::memory::ProcessMemory::current() {
+        eprintln!(
+            "phase {name}: rss {} MiB, peak {} MiB",
+            m.rss_kib / 1024,
+            m.hwm_kib / 1024
+        );
+    }
+}
+
 /// `(allowed, booking_required)` for a GTFS pickup/drop-off type. Unknown
 /// values are treated as not available (only removes options).
-fn classify(t: &gtfs_structures::PickupDropOffType, stats: &mut (usize, usize)) -> (bool, bool) {
-    use gtfs_structures::PickupDropOffType as P;
-    match t {
-        P::Regular => (true, false),
-        P::NotAvailable => (false, false),
-        P::ArrangeByPhone | P::CoordinateWithDriver => {
+fn classify(code: u8, stats: &mut (usize, usize)) -> (bool, bool) {
+    match code {
+        0 => (true, false),
+        1 => (false, false),
+        2 | 3 => {
             stats.0 += 1;
             (true, true)
         }
-        P::Unknown(_) => {
+        _ => {
             stats.1 += 1;
             (false, false)
         }
+    }
+}
+
+fn pickup_code(t: &gtfs_structures::PickupDropOffType) -> u8 {
+    use gtfs_structures::PickupDropOffType as P;
+    match t {
+        P::Regular => 0,
+        P::NotAvailable => 1,
+        P::ArrangeByPhone => 2,
+        P::CoordinateWithDriver => 3,
+        P::Unknown(_) => u8::MAX,
+    }
+}
+
+/// Everything the export needs from the GTFS object graph, so the graph (the
+/// largest import allocation) can be freed before the export arrays exist.
+struct Extract {
+    stops: Vec<Stop>,
+    routes: HashMap<String, RouteInfo>,
+    /// GTFS trip id → `[pickup code, drop-off code]` per stop time.
+    pickup: HashMap<String, Vec<[u8; 2]>>,
+    timezone: String,
+}
+
+fn extract(gtfs: &Gtfs, tt: &GtfsTimetable, timezone: String) -> Extract {
+    let stops = (0..tt.n_stops())
+        .map(|i| {
+            let id = tt.stop_id(StopIdx::new(i as u32));
+            let s = &gtfs.stops[id];
+            Stop {
+                stop_id: id.into(),
+                name: s.name.clone().unwrap_or_else(|| id.into()),
+                lat: s.latitude,
+                lon: s.longitude,
+                parent_station: s.parent_station.clone(),
+            }
+        })
+        .collect();
+    let mut routes = HashMap::new();
+    for r in 0..tt.n_routes() {
+        let id = tt.route_id(RouteIdx::new(r as u32));
+        routes.entry(id.to_owned()).or_insert_with(|| {
+            let raw = &gtfs.routes[id];
+            RouteInfo {
+                route_id: id.to_owned(),
+                line: raw
+                    .short_name
+                    .clone()
+                    .filter(|s| !s.is_empty())
+                    .or_else(|| raw.long_name.clone())
+                    .unwrap_or_else(|| id.to_owned()),
+                mode: format!("{:?}", raw.route_type),
+            }
+        });
+    }
+    let mut pickup = HashMap::new();
+    for t in 0..tt.n_trips() {
+        let id = tt.trip_id(TripIdx::new(t as u32));
+        pickup.entry(id.to_owned()).or_insert_with(|| {
+            gtfs.trips[id]
+                .stop_times
+                .iter()
+                .map(|st| [pickup_code(&st.pickup_type), pickup_code(&st.drop_off_type)])
+                .collect()
+        });
+    }
+    Extract {
+        stops,
+        routes,
+        pickup,
+        timezone,
     }
 }
 
@@ -186,10 +372,15 @@ pub(crate) struct TransferRules {
     footpaths: BTreeMap<(String, String), u32>,
     /// Same-stop minimum change times (largest per stop).
     same_stop: BTreeMap<String, u32>,
+    /// Generalised trip/route-specific same-stop times: lower bound on the
+    /// final change time (after rule/default resolution).
+    same_stop_floor: BTreeMap<String, u32>,
     /// Distinct-stop `transfer_type 3` pairs.
     impossible: BTreeSet<(String, String)>,
     /// Dropped relaxing rule classes (only with `drop_relaxing_transfers`).
     pub(crate) dropped: BTreeMap<String, usize>,
+    /// Trips removed before routing (e.g. GTFS-Flex).
+    pub(crate) excluded_trips: BTreeMap<String, usize>,
     notes: Vec<String>,
 }
 
@@ -210,12 +401,18 @@ pub(crate) struct TransferRules {
 ///   allowed/forbidden – Rustis never models in-seat continuation). Restricting
 ///   classes (trip/route-specific 2/3, same-stop 3) are always rejected because
 ///   dropping them could admit transfers the feed forbids.
-fn read_transfer_rules(input: &Path, drop_relaxing: bool) -> Result<TransferRules> {
+fn read_transfer_rules(
+    input: &Path,
+    drop_relaxing: bool,
+    generalize: bool,
+) -> Result<TransferRules> {
     let mut rules = TransferRules {
         footpaths: BTreeMap::new(),
         same_stop: BTreeMap::new(),
+        same_stop_floor: BTreeMap::new(),
         impossible: BTreeSet::new(),
         dropped: BTreeMap::new(),
+        excluded_trips: BTreeMap::new(),
         notes: Vec::new(),
     };
     let Some(raw) = read_optional_member(input, "transfers.txt")? else {
@@ -244,6 +441,10 @@ fn read_transfer_rules(input: &Path, drop_relaxing: bool) -> Result<TransferRule
         col("min_transfer_time"),
     );
     let mut rows = 0usize;
+    let mut specific_same: BTreeMap<String, u32> = BTreeMap::new();
+    let mut specific_pair: BTreeMap<(String, String), u32> = BTreeMap::new();
+    let mut specific_forbidden: BTreeSet<(String, String)> = BTreeSet::new();
+    let mut generalised: BTreeMap<String, usize> = BTreeMap::new();
     let mut drop = |class: String, line: usize| -> Result<()> {
         ensure!(
             drop_relaxing,
@@ -265,11 +466,45 @@ fn read_transfer_rules(input: &Path, drop_relaxing: bool) -> Result<TransferRule
             "transfers.txt line {line}: unknown transfer_type {kind}"
         );
         if specific.iter().any(|&i| !field(Some(i)).is_empty()) {
-            ensure!(
-                !matches!(kind, "2" | "3"),
-                "transfers.txt line {line}: trip/route-specific transfer_type {kind} restricts transfers \
-                 and cannot be enforced; not supported"
-            );
+            if matches!(kind, "2" | "3") {
+                ensure!(
+                    generalize && !(kind == "3" && f == t),
+                    "transfers.txt line {line}: trip/route-specific transfer_type {kind} restricts transfers \
+                     and cannot be enforced; not supported{}",
+                    if kind == "3" && f == t {
+                        ""
+                    } else {
+                        " (--generalize-restricting-transfers applies it to all trips)"
+                    }
+                );
+                ensure!(
+                    !f.is_empty() && !t.is_empty(),
+                    "transfers.txt line {line}: stop ids required"
+                );
+                if kind == "3" {
+                    specific_forbidden.insert((f.to_owned(), t.to_owned()));
+                } else {
+                    let m: u32 = field(min).parse().with_context(|| {
+                        format!(
+                            "transfers.txt line {line}: transfer_type 2 requires min_transfer_time"
+                        )
+                    })?;
+                    let slot = if f == t {
+                        specific_same.entry(f.to_owned()).or_default()
+                    } else {
+                        specific_pair
+                            .entry((f.to_owned(), t.to_owned()))
+                            .or_default()
+                    };
+                    *slot = (*slot).max(m);
+                }
+                *generalised
+                    .entry(format!(
+                        "trip/route-specific type {kind} (generalised to all trips)"
+                    ))
+                    .or_default() += 1;
+                continue;
+            }
             drop(format!("trip/route-specific type {kind}"), line)?;
             continue;
         }
@@ -324,6 +559,27 @@ fn read_transfer_rules(input: &Path, drop_relaxing: bool) -> Result<TransferRule
             }
         }
     }
+    rules.dropped.extend(generalised);
+    // Generalised specific rules only tighten what stop-level rules allow.
+    let mut not_applied = 0usize;
+    for (pair, m) in specific_pair {
+        match rules.footpaths.get_mut(&pair) {
+            Some(x) => *x = (*x).max(m),
+            None => not_applied += 1,
+        }
+    }
+    for pair in specific_forbidden {
+        if rules.footpaths.remove(&pair).is_none() {
+            not_applied += 1;
+        }
+    }
+    rules.same_stop_floor = specific_same;
+    if generalize {
+        rules.notes.push(format!(
+            "generalised {} specific same-stop times; {not_applied} specific walk rules without a stop-level footpath create none",
+            rules.same_stop_floor.len()
+        ));
+    }
     // A forbidden pair wins over a footpath for the same pair.
     let conflicting = rules
         .impossible
@@ -339,7 +595,7 @@ fn read_transfer_rules(input: &Path, drop_relaxing: bool) -> Result<TransferRule
     ));
     if !rules.dropped.is_empty() {
         rules.notes.push(format!(
-            "CONSERVATIVE: dropped relaxing transfer rules {:?}; connections they allow are missing",
+            "CONSERVATIVE: transfer rules not modelled exactly {:?} (relaxing dropped / restricting generalised); connections are missing",
             rules.dropped
         ));
     }
@@ -491,7 +747,7 @@ fn reject_dst_window(tz: &str, date: &str) -> Result<()> {
 }
 
 fn write_snapshot(
-    gtfs: &Gtfs,
+    ex: &Extract,
     tt: &GtfsTimetable,
     dir: &Path,
     opts: &ImportOptions,
@@ -501,19 +757,7 @@ fn write_snapshot(
 ) -> Result<ImportReport> {
     let impossible = &rules.impossible;
     let (n_stops, n_routes, n_trips) = (tt.n_stops(), tt.n_routes(), tt.n_trips());
-    let stops: Vec<Stop> = (0..n_stops)
-        .map(|i| {
-            let id = tt.stop_id(StopIdx::new(i as u32));
-            let s = &gtfs.stops[id];
-            Stop {
-                stop_id: id.into(),
-                name: s.name.clone().unwrap_or_else(|| id.into()),
-                lat: s.latitude,
-                lon: s.longitude,
-                parent_station: s.parent_station.clone(),
-            }
-        })
-        .collect();
+    let stops: Vec<Stop> = ex.stops.clone();
 
     let mut routes: Vec<RouteInfo> = Vec::new();
     let mut route_index: HashMap<String, u32> = HashMap::new();
@@ -531,17 +775,7 @@ fn write_snapshot(
         let rid = RouteIdx::new(r as u32);
         let gtfs_id = tt.route_id(rid);
         let gi = *route_index.entry(gtfs_id.to_owned()).or_insert_with(|| {
-            let raw = &gtfs.routes[gtfs_id];
-            routes.push(RouteInfo {
-                route_id: gtfs_id.to_owned(),
-                line: raw
-                    .short_name
-                    .clone()
-                    .filter(|s| !s.is_empty())
-                    .or_else(|| raw.long_name.clone())
-                    .unwrap_or_else(|| gtfs_id.to_owned()),
-                mode: format!("{:?}", raw.route_type),
-            });
+            routes.push(ex.routes[gtfs_id].clone());
             routes.len() as u32 - 1
         });
         let ss = tt.get_stops_after(rid, 0);
@@ -549,12 +783,12 @@ fn write_snapshot(
         // Per-trip flags for every stop position.
         let mut trip_flags: Vec<(TripIdx, Vec<u8>)> = Vec::new();
         for &t in tt.trips_on_route(rid) {
-            let raw = gtfs.trips[tt.trip_id(t)].stop_times.as_slice();
+            let raw = &ex.pickup[tt.trip_id(t)];
             let fl = (0..n_pos as u32)
                 .map(|p| {
-                    let st = &raw[p as usize];
-                    let (pick, pick_book) = classify(&st.pickup_type, &mut booking_stats);
-                    let (drop, drop_book) = classify(&st.drop_off_type, &mut booking_stats);
+                    let [pc, dc] = raw[p as usize];
+                    let (pick, pick_book) = classify(pc, &mut booking_stats);
+                    let (drop, drop_book) = classify(dc, &mut booking_stats);
                     let excl = opts.exclude_booking_stops;
                     let mut f = 0u8;
                     if !tt.pickup_allowed(t, p) || !pick || (pick_book && excl) {
@@ -677,6 +911,7 @@ fn write_snapshot(
                 .get(id)
                 .copied()
                 .unwrap_or(opts.default_change_seconds)
+                .max(rules.same_stop_floor.get(id).copied().unwrap_or(0))
         })
         .collect();
     w.u32s(Sec::StopChangeSecs, change_secs);
@@ -697,11 +932,19 @@ fn write_snapshot(
     w.u64s(Sec::TripIdOffsets, id_offsets);
     w.bytes(Sec::TripIdBytes, id_bytes);
 
+    phase("export arrays built");
     let tt_path = dir.join("timetable.bin");
     let mut out = BufWriter::new(File::create(&tt_path)?);
     let timetable_bytes = w.write_to(&mut out)?;
     out.into_inner().map_err(|e| e.into_error())?.sync_all()?;
-    let fnv = fnv64(&fs::read(&tt_path)?);
+    phase("timetable written");
+    let fnv = {
+        // Streamed: the file can be larger than the remaining memory budget.
+        let mut f = std::io::BufReader::new(File::open(&tt_path)?);
+        let mut h = crate::format::Fnv64::default();
+        std::io::copy(&mut f, &mut h)?;
+        h.0
+    };
 
     let mut notes = notes;
     notes.push(format!(
@@ -721,7 +964,7 @@ fn write_snapshot(
         version: METADATA_VERSION,
         rustis_version: env!("CARGO_PKG_VERSION").into(),
         service_date: opts.date.clone(),
-        timezone: single_timezone(gtfs)?,
+        timezone: ex.timezone.clone(),
         source: source.into(),
         footpaths_closed: tt.footpaths_are_transitively_closed(),
         walk_radius_m: opts.walk_radius_m,
@@ -736,6 +979,7 @@ fn write_snapshot(
             "conservative".into()
         },
         dropped_transfer_rules: rules.dropped.clone(),
+        excluded_trips: rules.excluded_trips.clone(),
         default_change_seconds: opts.default_change_seconds,
         stops,
         routes,

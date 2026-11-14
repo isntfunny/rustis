@@ -33,6 +33,10 @@ enum Cmd {
         /// snapshot and every response are marked as possibly incomplete.
         #[arg(long)]
         drop_relaxing_transfers: bool,
+        /// Apply trip/route-specific min-time/forbidden rules to all trips at
+        /// those stops (only tightens; marks the snapshot conservative).
+        #[arg(long)]
+        generalize_restricting_transfers: bool,
         /// Minimum change time (s) at stops without a same-stop transfers.txt rule.
         #[arg(long, default_value_t = 0)]
         default_change_seconds: u32,
@@ -40,6 +44,21 @@ enum Cmd {
         /// instead of returning it marked `booking_required`.
         #[arg(long)]
         exclude_booking_stops: bool,
+        /// Parse the full feed instead of stream-filtering it to the snapshot days.
+        #[arg(long)]
+        no_prefilter: bool,
+        /// Remove GTFS-Flex trips (on-demand zones/windows) instead of failing;
+        /// the snapshot and every response are marked incomplete.
+        #[arg(long)]
+        exclude_flex_trips: bool,
+        /// Remove frequency-based trips (frequencies.txt) instead of failing;
+        /// the snapshot and every response are marked incomplete.
+        #[arg(long)]
+        exclude_frequency_trips: bool,
+        /// Regional partition min_lat,min_lon,max_lat,max_lon: keep only trips
+        /// serving a stop inside (whole trips). Marked in metadata and responses.
+        #[arg(long)]
+        bbox: Option<String>,
     },
     /// Plan a journey against a snapshot.
     Plan {
@@ -132,16 +151,39 @@ fn main() -> Result<()> {
             walk_radius_m,
             walk_speed,
             drop_relaxing_transfers,
+            generalize_restricting_transfers,
             default_change_seconds,
             exclude_booking_stops,
+            no_prefilter,
+            exclude_flex_trips,
+            exclude_frequency_trips,
+            bbox,
         } => {
             let opts = ImportOptions {
                 date,
                 walk_radius_m,
                 walk_speed_m_per_s: walk_speed,
                 drop_relaxing_transfers,
+                generalize_restricting_transfers,
                 default_change_seconds,
                 exclude_booking_stops,
+                prefilter: !no_prefilter,
+                exclude_flex_trips,
+                exclude_frequency_trips,
+                region_bbox: match bbox {
+                    None => None,
+                    Some(b) => {
+                        let v: Vec<f64> = b
+                            .split(',')
+                            .map(|x| x.trim().parse())
+                            .collect::<Result<_, _>>()
+                            .context("bbox numbers")?;
+                        let [a, b, c, d] = v[..] else {
+                            bail!("bbox needs four numbers")
+                        };
+                        Some([a, b, c, d])
+                    }
+                },
             };
             let r = import_gtfs_with(&gtfs, &out, &opts)?;
             println!(

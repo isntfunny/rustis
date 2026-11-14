@@ -50,6 +50,7 @@ impl Snapshot {
         let targets = self.endpoints("to", &q.to)?;
         let origin_walk: HashMap<StopIdx, u32> = origins.iter().map(|&(s, d)| (s, d.0)).collect();
 
+        let t0 = std::time::Instant::now();
         let journeys = {
             let mut cache = self.caches.checkout();
             self.tt
@@ -61,6 +62,7 @@ impl Snapshot {
                 .run_with_cache(&mut cache)
         };
 
+        let t_raptor = t0.elapsed();
         let mut omitted = 0;
         let mut found = Vec::new();
         for j in &journeys {
@@ -82,6 +84,14 @@ impl Snapshot {
             }
         }
         itineraries.truncate(q.max_results);
+        if std::env::var_os("RUSTIS_TIMING").is_some() {
+            eprintln!(
+                "timing: raptor {:?} ({} journeys), reconstruction {:?}",
+                t_raptor,
+                journeys.len(),
+                t0.elapsed() - t_raptor
+            );
+        }
         let any_booking = itineraries.iter().any(|i| i.booking_required);
         Ok(PlanResponse {
             service_date: self.meta.service_date.clone(),
@@ -111,7 +121,7 @@ impl Snapshot {
         let mut best: Vec<(StopIdx, Duration)> = Vec::new();
         for e in eps {
             let s = *self.stop_by_id.get(&e.stop_id).ok_or_else(|| {
-                Error::invalid(format!("unknown stop_id {:?} in `{side}`", e.stop_id))
+                Error::invalid(format!("unknown stop_id {:?} in `{side}` (not in this snapshot or not served on its days)", e.stop_id))
             })?;
             if e.walk_seconds > MAX_ENDPOINT_WALK {
                 return Err(Error::invalid(format!(
@@ -440,16 +450,25 @@ impl Snapshot {
 
     /// Warnings attached to every plan response of an incomplete snapshot.
     pub fn warnings(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if !self.meta.excluded_trips.is_empty() {
+            out.push(format!(
+                "INCOMPLETE: trips were excluded from this snapshot {:?} (GTFS-Flex / frequency-based service or a regional partition).",
+                self.meta.excluded_trips
+            ));
+        }
         if self.meta.transfer_mode == "strict" {
-            return Vec::new();
+            return out;
         }
         let n: usize = self.meta.dropped_transfer_rules.values().sum();
-        vec![format!(
-            "INCOMPLETE: snapshot dropped {n} relaxing transfer rules {:?} (guaranteed/in-seat/recommended). \
-             Itineraries obey all kept rules but connections relying on dropped rules are missing; \
-             do not treat 'no result' or the ranking as authoritative.",
+        out.push(format!(
+            "INCOMPLETE: {n} transfer rules were not modelled exactly {:?}. Relaxing rules \
+             (guaranteed/in-seat/recommended) were dropped and/or restricting trip/route-specific rules \
+             were generalised to all trips. Itineraries obey every modelled rule, but connections are \
+             missing; do not treat 'no result' or the ranking as authoritative.",
             self.meta.dropped_transfer_rules
-        )]
+        ));
+        out
     }
 
     pub fn import_notes(&self) -> &[String] {

@@ -4,6 +4,7 @@ pub mod http;
 mod import;
 pub mod memory;
 mod model;
+mod prefilter;
 mod routing;
 mod storage;
 
