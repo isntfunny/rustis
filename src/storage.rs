@@ -148,7 +148,7 @@ fn check_offsets<T: Copy + Into<u64>>(name: &str, o: &[T], n: usize, len: u64) -
 
 impl MappedTimetable {
     fn new(map: Mmap, meta: &Metadata) -> Result<Self> {
-        let dir = format::parse_directory(&map)?;
+        let dir = format::parse_directory(&map, format::MAGIC, &format::ALL_SECTIONS)?;
         let sec = |s: Sec| dir[s as usize];
         let n_stops = meta.stops.len();
         let n_routes = meta.n_raptor_routes;

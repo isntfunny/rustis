@@ -42,8 +42,6 @@ pub struct PrefilterStats {
     pub trips_kept: u64,
     pub stop_times_total: u64,
     pub stop_times_kept: u64,
-    pub stops_total: u64,
-    pub stops_kept: u64,
     /// Active GTFS-Flex trips removed (only with `exclude_flex`).
     pub flex_trips_removed: u64,
     /// Active frequency-based trips removed (only with `exclude_frequency`).
@@ -124,7 +122,6 @@ pub fn prefilter(
     days: &[NaiveDate],
     exclude_flex: bool,
     exclude_frequency: bool,
-    bbox: Option<[f64; 4]>,
 ) -> Result<PrefilterStats> {
     fs::create_dir(out).with_context(|| format!("creating {}", out.display()))?;
     let mut src = Source::open(input)?;
@@ -218,55 +215,6 @@ pub fn prefilter(
     })?;
     ensure!(found.is_some(), "feed has no trips.txt");
 
-    if let Some([min_lat, min_lon, max_lat, max_lon]) = bbox {
-        // Regional partition: keep (whole) trips that serve at least one stop
-        // inside the box.
-        let mut inside: HashSet<Vec<u8>> = HashSet::new();
-        src.with("stops.txt", |r| {
-            let mut rdr = reader(r);
-            let h = rdr.byte_headers()?.clone();
-            let (i, la, lo) = (
-                column(&h, "stop_id"),
-                column(&h, "stop_lat"),
-                column(&h, "stop_lon"),
-            );
-            let (Some(i), Some(la), Some(lo)) = (i, la, lo) else {
-                anyhow::bail!("stops.txt needs stop_id/lat/lon")
-            };
-            for rec in rdr.byte_records() {
-                let rec = rec?;
-                let (lat, lon): (f64, f64) = (
-                    field(&rec, la).parse().unwrap_or(f64::NAN),
-                    field(&rec, lo).parse().unwrap_or(f64::NAN),
-                );
-                if (min_lat..=max_lat).contains(&lat) && (min_lon..=max_lon).contains(&lon) {
-                    inside.insert(rec.get(i).unwrap_or_default().to_vec());
-                }
-            }
-            Ok(())
-        })?;
-        let mut touching: HashSet<Vec<u8>> = HashSet::new();
-        src.with("stop_times.txt", |r| {
-            let mut rdr = reader(r);
-            let h = rdr.byte_headers()?.clone();
-            let (t, st) = (column(&h, "trip_id"), column(&h, "stop_id"));
-            let (Some(t), Some(st)) = (t, st) else {
-                anyhow::bail!("stop_times.txt needs trip_id/stop_id")
-            };
-            for rec in rdr.byte_records() {
-                let rec = rec?;
-                let trip = rec.get(t).unwrap_or_default();
-                if kept.contains(trip)
-                    && inside.contains(rec.get(st).unwrap_or_default())
-                    && !touching.contains(trip)
-                {
-                    touching.insert(trip.to_vec());
-                }
-            }
-            Ok(())
-        })?;
-        kept.retain(|t| touching.contains(t));
-    }
     stats.trips_kept = kept.len() as u64;
     src.with("trips.txt", |r| {
         let mut rdr = reader(r);
@@ -285,7 +233,6 @@ pub fn prefilter(
     })?;
 
     let mut flex: HashSet<Vec<u8>> = HashSet::new();
-    let mut served: HashSet<Vec<u8>> = HashSet::new();
     let mut freq: HashSet<Vec<u8>> = HashSet::new();
     for name in ["stop_times.txt", "frequencies.txt"] {
         let is_st = name == "stop_times.txt";
@@ -330,12 +277,6 @@ pub fn prefilter(
                     }
                     if is_st {
                         stats.stop_times_kept += 1;
-                        if let Some(i) = stop {
-                            let id = rec.get(i).unwrap_or_default();
-                            if !served.contains(id) {
-                                served.insert(id.to_vec());
-                            }
-                        }
                         let no_stop = stop.is_none_or(|i| field(&rec, i).is_empty());
                         if no_stop || flex_cols.iter().any(|&i| !field(&rec, i).is_empty()) {
                             flex.insert(rec.get(t).unwrap_or_default().to_vec());
@@ -398,93 +339,14 @@ pub fn prefilter(
         })?;
     }
 
-    // Stops: served ones, endpoints of transfer rows touching a served stop
-    // (keeps walking chains through unserved stops), and their parents.
-    let mut keep = served;
-    let mut transfer_ends: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-    src.with("transfers.txt", |r| {
-        let mut rdr = reader(r);
-        let h = rdr.byte_headers()?.clone();
-        let (Some(f), Some(t)) = (column(&h, "from_stop_id"), column(&h, "to_stop_id")) else {
-            return Ok(());
-        };
-        for rec in rdr.byte_records() {
-            let rec = rec?;
-            transfer_ends.push((
-                rec.get(f).unwrap_or_default().to_vec(),
-                rec.get(t).unwrap_or_default().to_vec(),
-            ));
-        }
-        Ok(())
-    })?;
-    let touching: Vec<Vec<u8>> = transfer_ends
-        .iter()
-        .filter(|(a, b)| keep.contains(a) || keep.contains(b))
-        .flat_map(|(a, b)| [a.clone(), b.clone()])
-        .collect();
-    keep.extend(touching);
-    drop(transfer_ends);
-    let mut parents: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
-    src.with("stops.txt", |r| {
-        let mut rdr = reader(r);
-        let h = rdr.byte_headers()?.clone();
-        let (Some(i), Some(p)) = (column(&h, "stop_id"), column(&h, "parent_station")) else {
-            return Ok(());
-        };
-        for rec in rdr.byte_records() {
-            let rec = rec?;
-            let parent = rec.get(p).unwrap_or_default();
-            if !parent.is_empty() {
-                parents.insert(rec.get(i).unwrap_or_default().to_vec(), parent.to_vec());
-            }
-        }
-        Ok(())
-    })?;
-    for _ in 0..2 {
-        let add: Vec<Vec<u8>> = keep
-            .iter()
-            .filter_map(|s| parents.get(s).cloned())
-            .collect();
-        keep.extend(add);
-    }
-    let filter_file =
-        |src: &mut Source, name: &str, cols: &[&str], stats: &mut PrefilterStats| -> Result<()> {
-            src.with(name, |r| {
-                let mut rdr = reader(r);
-                let h = rdr.byte_headers()?.clone();
-                let idx: Vec<usize> = cols.iter().filter_map(|c| column(&h, c)).collect();
-                let mut w = csv::Writer::from_writer(BufWriter::new(File::create(out.join(name))?));
-                w.write_byte_record(&h)?;
-                for rec in rdr.byte_records() {
-                    let rec = rec?;
-                    let ids: Vec<&[u8]> = idx
-                        .iter()
-                        .map(|&i| rec.get(i).unwrap_or_default())
-                        .collect();
-                    if name == "stops.txt" {
-                        stats.stops_total += 1;
-                    }
-                    // Rows with missing ids are kept so the importer reports them.
-                    if ids.iter().all(|id| id.is_empty() || keep.contains(*id))
-                        || ids.iter().any(|id| id.is_empty())
-                    {
-                        if name == "stops.txt" {
-                            stats.stops_kept += 1;
-                        }
-                        w.write_byte_record(&rec)?;
-                    }
-                }
-                w.flush()?;
-                Ok(())
-            })?;
+    // The full stop catalogue and all transfer rows are kept: no stop is
+    // dropped, even if no trip serves it on the snapshot days.
+    for name in ["stops.txt", "transfers.txt"] {
+        src.with(name, |r| {
+            let mut f = BufWriter::new(File::create(out.join(name))?);
+            std::io::copy(r, &mut f)?;
             Ok(())
-        };
-    filter_file(&mut src, "stops.txt", &["stop_id"], &mut stats)?;
-    filter_file(
-        &mut src,
-        "transfers.txt",
-        &["from_stop_id", "to_stop_id"],
-        &mut stats,
-    )?;
+        })?;
+    }
     Ok(stats)
 }

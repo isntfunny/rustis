@@ -121,7 +121,7 @@ impl Snapshot {
         let mut best: Vec<(StopIdx, Duration)> = Vec::new();
         for e in eps {
             let s = *self.stop_by_id.get(&e.stop_id).ok_or_else(|| {
-                Error::invalid(format!("unknown stop_id {:?} in `{side}` (not in this snapshot or not served on its days)", e.stop_id))
+                Error::invalid(format!("unknown stop_id {:?} in `{side}`", e.stop_id))
             })?;
             if e.walk_seconds > MAX_ENDPOINT_WALK {
                 return Err(Error::invalid(format!(
@@ -453,7 +453,7 @@ impl Snapshot {
         let mut out = Vec::new();
         if !self.meta.excluded_trips.is_empty() {
             out.push(format!(
-                "INCOMPLETE: trips were excluded from this snapshot {:?} (GTFS-Flex / frequency-based service or a regional partition).",
+                "INCOMPLETE: trips were excluded from this snapshot {:?} (GTFS-Flex / frequency-based service is not routed).",
                 self.meta.excluded_trips
             ));
         }

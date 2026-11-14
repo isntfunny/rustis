@@ -217,41 +217,7 @@ fn frequency_trips_are_rejected_by_default_and_excluded_on_request() {
 }
 
 #[test]
-fn regional_partition_keeps_whole_trips_touching_the_box_and_is_marked() {
-    let tmp = TempDir::new().unwrap();
-    let mut o = ImportOptions::for_date("2026-11-16");
-    // Only stop A (50.000, 8.000) is inside: T2 (D→C) is dropped, trips from
-    // A are kept with all their stops (also C outside the box).
-    o.region_bbox = Some([49.995, 7.995, 50.005, 8.005]);
-    import_gtfs_with(&fixture(), &tmp.path().join("s"), &o).unwrap();
-    let s = Snapshot::open(&tmp.path().join("s")).unwrap();
-    let r = s
-        .plan(&PlanRequest {
-            date: "2026-11-16".into(),
-            departure: 8 * 3600,
-            from: vec![Endpoint {
-                stop_id: "A".into(),
-                walk_seconds: 0,
-            }],
-            to: vec![Endpoint {
-                stop_id: "C".into(),
-                walk_seconds: 0,
-            }],
-            max_transfers: 3,
-            max_results: 10,
-        })
-        .unwrap();
-    let json = serde_json::to_string(&r.itineraries).unwrap();
-    assert!(json.contains("SLOW") && !json.contains("\"T2\""), "{json}");
-    assert!(
-        r.warnings.iter().any(|w| w.contains("regional")),
-        "{:?}",
-        r.warnings
-    );
-}
-
-#[test]
-fn unserved_stops_are_dropped_but_walking_chains_survive() {
+fn full_stop_catalogue_is_kept_including_unserved_stops() {
     let tmp = TempDir::new().unwrap();
     let src = tmp.path().join("feed");
     std::fs::create_dir_all(&src).unwrap();
@@ -273,11 +239,7 @@ fn unserved_stops_are_dropped_but_walking_chains_survive() {
         o.prefilter = prefilter;
         import_gtfs_with(&src, &dest, &o).unwrap();
         let s = Snapshot::open(&dest).unwrap();
-        assert_eq!(
-            s.stats().stops,
-            if prefilter { 5 } else { 6 },
-            "Z dropped only by the prefilter"
-        );
+        assert_eq!(s.stats().stops, 6, "every stop is kept, also the unserved Z");
         let r = s
             .plan(&PlanRequest {
                 date: "2026-11-16".into(),

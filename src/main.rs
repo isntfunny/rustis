@@ -55,10 +55,6 @@ enum Cmd {
         /// the snapshot and every response are marked incomplete.
         #[arg(long)]
         exclude_frequency_trips: bool,
-        /// Regional partition min_lat,min_lon,max_lat,max_lon: keep only trips
-        /// serving a stop inside (whole trips). Marked in metadata and responses.
-        #[arg(long)]
-        bbox: Option<String>,
     },
     /// Plan a journey against a snapshot.
     Plan {
@@ -157,7 +153,6 @@ fn main() -> Result<()> {
             no_prefilter,
             exclude_flex_trips,
             exclude_frequency_trips,
-            bbox,
         } => {
             let opts = ImportOptions {
                 date,
@@ -170,20 +165,6 @@ fn main() -> Result<()> {
                 prefilter: !no_prefilter,
                 exclude_flex_trips,
                 exclude_frequency_trips,
-                region_bbox: match bbox {
-                    None => None,
-                    Some(b) => {
-                        let v: Vec<f64> = b
-                            .split(',')
-                            .map(|x| x.trim().parse())
-                            .collect::<Result<_, _>>()
-                            .context("bbox numbers")?;
-                        let [a, b, c, d] = v[..] else {
-                            bail!("bbox needs four numbers")
-                        };
-                        Some([a, b, c, d])
-                    }
-                },
             };
             let r = import_gtfs_with(&gtfs, &out, &opts)?;
             println!(

@@ -44,9 +44,6 @@ pub struct ImportOptions {
     pub exclude_flex_trips: bool,
     /// Remove frequency-based trips (frequencies.txt) instead of failing.
     pub exclude_frequency_trips: bool,
-    /// Regional partition `[min_lat, min_lon, max_lat, max_lon]`: keep only
-    /// trips serving a stop inside (complete trips, incl. stops outside).
-    pub region_bbox: Option<[f64; 4]>,
 }
 
 impl ImportOptions {
@@ -62,7 +59,6 @@ impl ImportOptions {
             prefilter: true,
             exclude_flex_trips: false,
             exclude_frequency_trips: false,
-            region_bbox: None,
         }
     }
 }
@@ -91,16 +87,6 @@ pub fn import_gtfs_with(input: &Path, dest: &Path, opts: &ImportOptions) -> Resu
         "destination {} already exists; snapshots are immutable",
         dest.display()
     );
-    ensure!(
-        opts.prefilter || opts.region_bbox.is_none(),
-        "--bbox requires the prefilter"
-    );
-    if let Some([a, b, c, d]) = opts.region_bbox {
-        ensure!(
-            a < c && b < d && [a, b, c, d].iter().all(|v| v.is_finite()),
-            "bbox must be min_lat,min_lon,max_lat,max_lon"
-        );
-    }
     if !opts.prefilter {
         return import_prepared(input, input, dest, opts, Vec::new(), BTreeMap::new());
     }
@@ -120,13 +106,12 @@ pub fn import_gtfs_with(input: &Path, dest: &Path, opts: &ImportOptions) -> Resu
     ));
     let result = crate::prefilter::prefilter(input, &work, &[day, day + chrono::Days::new(1)], opts.exclude_flex_trips,
         opts.exclude_frequency_trips,
-        opts.region_bbox,
     )
         .and_then(|st| {
             phase(&format!("prefilter done ({} stop_times kept)", st.stop_times_kept));
             let note = format!(
-                "prefilter: kept {}/{} trips, {}/{} stop_times active on {} or the next day, {}/{} stops (served, transfer endpoints, parents); shapes dropped",
-                st.trips_kept, st.trips_total, st.stop_times_kept, st.stop_times_total, opts.date, st.stops_kept, st.stops_total
+                "prefilter: kept {}/{} trips, {}/{} stop_times active on {} or the next day, all stops kept; shapes dropped",
+                st.trips_kept, st.trips_total, st.stop_times_kept, st.stop_times_total, opts.date
             );
             let mut notes = vec![note];
             let mut excluded = BTreeMap::new();
@@ -135,12 +120,6 @@ pub fn import_gtfs_with(input: &Path, dest: &Path, opts: &ImportOptions) -> Resu
             }
             if st.frequency_trips_removed > 0 {
                 excluded.insert("frequency-based trips".to_owned(), st.frequency_trips_removed as usize);
-            }
-            if let Some(b) = opts.region_bbox {
-                excluded.insert(
-                    format!("trips not serving region {b:?} (regional partition)"),
-                    (st.trips_total - st.trips_kept) as usize,
-                );
             }
             if !excluded.is_empty() {
                 notes.push(format!("EXCLUDED: {excluded:?}"));
@@ -935,7 +914,7 @@ fn write_snapshot(
     phase("export arrays built");
     let tt_path = dir.join("timetable.bin");
     let mut out = BufWriter::new(File::create(&tt_path)?);
-    let timetable_bytes = w.write_to(&mut out)?;
+    let timetable_bytes = w.write_to(&mut out, crate::format::MAGIC)?;
     out.into_inner().map_err(|e| e.into_error())?.sync_all()?;
     phase("timetable written");
     let fnv = {

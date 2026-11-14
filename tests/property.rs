@@ -315,18 +315,7 @@ fn run(with_change_times: bool, seeds: std::ops::Range<u64>) -> (usize, usize, u
                         max_transfers: 8,
                         max_results: 10,
                     });
-                    // The prefilter drops stops no trip serves on the snapshot days.
-                    let r = match r {
-                        Ok(r) => r,
-                        Err(e) if e.to_string().contains("not served") => {
-                            assert!(
-                                brute_force(&net, from, to, depart).is_none_or(|t| t.is_none()),
-                                "{ctx}: {e}"
-                            );
-                            continue;
-                        }
-                        Err(e) => panic!("{ctx}: {e}"),
-                    };
+                    let r = r.unwrap_or_else(|e| panic!("{ctx}: {e}"));
                     assert_eq!(r.omitted_unreconstructable, 0, "{ctx}");
                     for it in &r.itineraries {
                         check(&net, it, depart, &ctx);

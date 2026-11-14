@@ -34,6 +34,16 @@ pub enum Sec {
     TripIdOffsets = 15,
     TripIdBytes = 16,
     StopChangeSecs = 17,
+    // catalog.bin
+    CatIdOffsets = 20,
+    CatIdBytes = 21,
+    CatNameOffsets = 22,
+    CatNameBytes = 23,
+    CatParent = 24,
+    CatLat = 25,
+    CatLon = 26,
+    CatIdSorted = 27,
+    CatLatSorted = 28,
 }
 
 pub const ALL_SECTIONS: [Sec; 17] = [
@@ -56,11 +66,29 @@ pub const ALL_SECTIONS: [Sec; 17] = [
     Sec::StopChangeSecs,
 ];
 
+pub const CATALOG_MAGIC: &[u8; 8] = b"RUSTISCT";
+pub const CATALOG_SECTIONS: [Sec; 9] = [
+    Sec::CatIdOffsets,
+    Sec::CatIdBytes,
+    Sec::CatNameOffsets,
+    Sec::CatNameBytes,
+    Sec::CatParent,
+    Sec::CatLat,
+    Sec::CatLon,
+    Sec::CatIdSorted,
+    Sec::CatLatSorted,
+];
+
 impl Sec {
     pub fn elem_size(self) -> u32 {
         match self {
-            Sec::RouteCellOffsets | Sec::TripIdOffsets => 8,
-            Sec::Flags | Sec::TripIdBytes => 1,
+            Sec::RouteCellOffsets
+            | Sec::TripIdOffsets
+            | Sec::CatIdOffsets
+            | Sec::CatNameOffsets
+            | Sec::CatLat
+            | Sec::CatLon => 8,
+            Sec::Flags | Sec::TripIdBytes | Sec::CatIdBytes | Sec::CatNameBytes => 1,
             _ => 4,
         }
     }
@@ -93,12 +121,12 @@ impl Writer {
         self.sections.push((sec, values));
     }
 
-    pub fn write_to(mut self, out: &mut impl Write) -> Result<u64> {
+    pub fn write_to(mut self, out: &mut impl Write, magic: &[u8; 8]) -> Result<u64> {
         self.sections.sort_by_key(|(s, _)| *s);
         let header = 16 + DIR_ENTRY * self.sections.len();
         let mut offset = align8(header as u64);
         let mut dir = Vec::with_capacity(header);
-        dir.extend_from_slice(MAGIC);
+        dir.extend_from_slice(magic);
         dir.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
         dir.extend_from_slice(&(self.sections.len() as u32).to_le_bytes());
         for (sec, data) in &self.sections {
@@ -132,14 +160,16 @@ pub struct Range {
     pub count: usize,
 }
 
-pub fn parse_directory(file: &[u8]) -> Result<[Range; 18]> {
+pub const MAX_SECTION_ID: usize = 32;
+
+pub fn parse_directory(file: &[u8], magic: &[u8; 8], expected: &[Sec]) -> Result<[Range; MAX_SECTION_ID]> {
     ensure!(
         file.len() >= 16,
         "timetable file truncated ({} bytes)",
         file.len()
     );
     ensure!(
-        &file[..8] == MAGIC,
+        &file[..8] == magic,
         "not a Rustis timetable file (bad magic)"
     );
     let version = le_u32(file, 8);
@@ -148,17 +178,17 @@ pub fn parse_directory(file: &[u8]) -> Result<[Range; 18]> {
         "unsupported timetable format version {version}"
     );
     let n = le_u32(file, 12) as usize;
-    ensure!(n == ALL_SECTIONS.len(), "unexpected section count {n}");
+    ensure!(n == expected.len(), "unexpected section count {n}");
     ensure!(
         file.len() >= 16 + n * DIR_ENTRY,
         "section directory truncated"
     );
-    let mut ranges = [Range::default(); 18];
-    let mut seen = [false; 18];
+    let mut ranges = [Range::default(); MAX_SECTION_ID];
+    let mut seen = [false; MAX_SECTION_ID];
     for i in 0..n {
         let at = 16 + i * DIR_ENTRY;
         let id = le_u32(file, at);
-        let Some(sec) = ALL_SECTIONS.iter().copied().find(|s| *s as u32 == id) else {
+        let Some(sec) = expected.iter().copied().find(|s| *s as u32 == id) else {
             bail!("unknown section id {id}");
         };
         ensure!(!seen[id as usize], "duplicate section {sec:?}");
