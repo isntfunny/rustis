@@ -35,26 +35,36 @@ impl Hasher for Fx {
 }
 pub type FxMap<K, V> = HashMap<K, V, BuildHasherDefault<Fx>>;
 
-/// Dense per-stop `u32` slots, zero-initialised by the allocator (calloc):
-/// pages are only backed by memory once a slot on them is written, so a
-/// search that touches few stops stays small while a huge search costs at
+/// Dense per-stop `u32` slots in an anonymous private mapping: pages are
+/// zero-filled on first write only, and the whole mapping goes back to the
+/// kernel when the search ends (a heap `Vec` would stay in the allocator's
+/// arena and keep the process RSS at its high-water mark). A search that
+/// touches few stops therefore stays small, while a huge search costs at
 /// most 4 B per stop instead of a hash-map entry (~16–24 B).
-struct Lazy(Vec<u32>);
+struct Lazy(memmap2::MmapMut);
 
 impl Lazy {
     fn new(n: usize) -> Self {
-        Self(vec![0; n])
+        Self(
+            memmap2::MmapMut::map_anon((n.max(1)) * 4).expect("anonymous mapping for search state"),
+        )
+    }
+    #[inline]
+    fn slot(&self, i: u32) -> u32 {
+        let o = i as usize * 4;
+        u32::from_ne_bytes(self.0[o..o + 4].try_into().unwrap())
     }
     #[inline]
     fn get(&self, i: u32) -> Option<u32> {
-        match self.0[i as usize] {
+        match self.slot(i) {
             0 => None,
             v => Some(v - 1),
         }
     }
     #[inline]
     fn set(&mut self, i: u32, v: u32) {
-        self.0[i as usize] = v.min(u32::MAX - 1) + 1;
+        let o = i as usize * 4;
+        self.0[o..o + 4].copy_from_slice(&(v.min(u32::MAX - 1) + 1).to_ne_bytes());
     }
 }
 
