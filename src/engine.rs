@@ -248,7 +248,13 @@ impl Snapshot {
         let mut lb = raptor::LowerBound::new(&self.tt, &to.stops);
         let mut ok_window: Option<u32> = None;
         let mut truncated = false;
-        'outer: while found.len() < q.max_results && searches < 3 * q.max_results {
+        let rides = |found: &[(Journey, u32)]| {
+            found
+                .iter()
+                .filter(|(j, _)| j.steps.iter().any(|s| matches!(s, Step::Ride { .. })))
+                .count()
+        };
+        'outer: while rides(&found) < q.max_results && searches < 3 * q.max_results {
             // Iterative deepening: the first window with a result decides;
             // then one more search with slack collects Pareto alternatives
             // (fewer transfers, later arrival).
@@ -313,7 +319,12 @@ impl Snapshot {
                 {
                     continue;
                 }
-                next = next.min(dep);
+                // A walk without any ride can leave at any time: it must not
+                // pin the next search to `depart + 1` (1 s steps until the
+                // search budget is spent).
+                if j.steps.iter().any(|s| matches!(s, Step::Ride { .. })) {
+                    next = next.min(dep);
+                }
                 let sig = signature(&j);
                 if !found.iter().any(|(f, _)| signature(f) == sig) {
                     found.push((j, dep));

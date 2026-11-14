@@ -653,3 +653,51 @@ fn walks_may_pass_unserved_stops() {
         .unwrap();
     assert_eq!(walk.to.as_ref().unwrap().stop_id, "D");
 }
+
+/// A walk-only journey (origin and destination connected by a footpath) leaves
+/// whenever the query does; it must not stall the search for later departures.
+#[test]
+fn walk_only_journey_does_not_block_later_alternatives() {
+    let read = |n: &str| std::fs::read_to_string(fixture().join(n)).unwrap();
+    let mut trips = read("trips.txt");
+    let mut times = read("stop_times.txt");
+    for i in 0..7 {
+        let m = 5 * i;
+        trips += &format!("R1,daily,SH{i},Interchange east\n");
+        times += &format!(
+            "SH{i},08:{m:02}:00,08:{m:02}:00,B,1,0,0\nSH{i},08:{:02}:00,08:{:02}:00,D,2,0,0\n",
+            m + 1,
+            m + 1
+        );
+    }
+    let (_tmp, s) = import_feed(&[
+        ("trips.txt", &trips),
+        ("stop_times.txt", &times),
+        (
+            "transfers.txt",
+            "from_stop_id,to_stop_id,transfer_type,min_transfer_time\nB,D,2,900\n",
+        ),
+    ]);
+    let r = s
+        .plan(&PlanRequest {
+            from: vec![Endpoint {
+                stop_id: "B".into(),
+                walk_seconds: 0,
+            }],
+            to: vec![Endpoint {
+                stop_id: "D".into(),
+                walk_seconds: 0,
+            }],
+            ..request()
+        })
+        .unwrap();
+    let rides: Vec<u32> = r
+        .itineraries
+        .iter()
+        .filter(|i| i.legs.iter().any(|l| l.kind == LegKind::Transit))
+        .map(|i| i.departure)
+        .collect();
+    assert_eq!(rides.len(), 5, "{:?}", r.itineraries);
+    assert_eq!(rides[0], 8 * 3600);
+    assert_eq!(rides[4], 8 * 3600 + 20 * 60);
+}

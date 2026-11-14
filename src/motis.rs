@@ -372,8 +372,29 @@ fn itinerary_json(
         "startTime": utc(&it.departure_time),
         "endTime": utc(&it.arrival_time),
         "transfers": it.transfers,
-        "legs": it.legs.iter().map(|l| leg_json(ids, l, start, end)).collect::<Vec<_>>(),
+        "legs": merge_walks(&it.legs).iter().map(|l| leg_json(ids, l, start, end)).collect::<Vec<_>>(),
     })
+}
+
+/// Consecutive walks (access + footpath, footpath + egress) become one WALK leg,
+/// as in MOTIS.
+fn merge_walks(legs: &[Leg]) -> Vec<Leg> {
+    let mut out: Vec<Leg> = Vec::with_capacity(legs.len());
+    for l in legs {
+        match out.last_mut() {
+            Some(p) if p.kind != LegKind::Transit && l.kind != LegKind::Transit => {
+                p.to = l.to.clone();
+                p.arrival = l.arrival;
+                p.arrival_time = l.arrival_time.clone();
+                p.duration_seconds += l.duration_seconds;
+                if l.kind == LegKind::Egress {
+                    p.kind = LegKind::Egress;
+                }
+            }
+            _ => out.push(l.clone()),
+        }
+    }
+    out
 }
 
 /// `/api/v6/plan`.
@@ -464,6 +485,8 @@ pub fn plan(snap: &Snapshot, q: &PlanQuery, body: &PlanBody) -> Result<Value, Er
     sorted.sort_by_key(|it| (it.departure, it.arrival));
     let its: Vec<Value> = sorted
         .into_iter()
+        // walking alone belongs to `direct` (directModes), never to `itineraries`
+        .filter(|it| it.legs.iter().any(|l| l.kind == LegKind::Transit))
         .filter(|it| {
             modes.as_ref().is_none_or(|m| {
                 it.legs

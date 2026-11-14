@@ -110,7 +110,7 @@ pub enum LegKind {
     Egress,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct Leg {
     pub kind: LegKind,
     /// `None` for the rider's own origin position (access legs).

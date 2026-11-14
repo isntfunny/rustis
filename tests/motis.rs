@@ -119,6 +119,20 @@ async fn coordinates_use_stops_within_radius() {
     let legs = json["itineraries"][0]["legs"].as_array().unwrap();
     assert_eq!(legs[0]["mode"], "WALK");
     assert_eq!(legs[0]["to"]["stopId"], "A");
+    // MOTIS shape: never two WALK legs in a row, never a walk-only itinerary
+    for it in json["itineraries"].as_array().unwrap() {
+        let modes: Vec<&str> = it["legs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|l| l["mode"].as_str().unwrap())
+            .collect();
+        assert!(modes.iter().any(|m| *m != "WALK"), "{modes:?}");
+        assert!(
+            !modes.windows(2).any(|w| w == ["WALK", "WALK"]),
+            "{modes:?}"
+        );
+    }
     // no stop within 10 m: empty answer, not an error
     let uri =
         format!("/api/v6/plan?fromPlace=50.0005,8.0&toPlace=50.0205,8.02&radius=10&time={T0}");
