@@ -147,17 +147,23 @@ impl Snapshot {
         let mut searches = 0;
         let mut stats = Vec::new();
         let mut first_dep: Option<u32> = None;
+        let mut ok_window: Option<u32> = None;
         'outer: while found.len() < q.max_results && searches < 3 * q.max_results {
             // Iterative deepening: the first window with a result decides;
             // then one more search with slack collects Pareto alternatives
             // (fewer transfers, later arrival).
             let mut result = None;
-            let windows: Vec<u32> = WINDOWS
-                .iter()
-                .copied()
-                .filter(|&w| w < q.max_travel_seconds)
-                .chain([q.max_travel_seconds])
-                .collect();
+            // Once a window produced results, alternatives reuse it instead of
+            // growing from the smallest window again.
+            let windows: Vec<u32> = match ok_window {
+                Some(w) => vec![w],
+                None => WINDOWS
+                    .iter()
+                    .copied()
+                    .filter(|&w| w < q.max_travel_seconds)
+                    .chain([q.max_travel_seconds])
+                    .collect(),
+            };
             for w in windows {
                 let query = Query {
                     sources: &from.stops,
@@ -187,6 +193,7 @@ impl Snapshot {
                     };
                     stats.push(st2);
                     result = Some(if js2.is_empty() { js } else { js2 });
+                    ok_window = Some(w2.max(w));
                     break;
                 }
             }
