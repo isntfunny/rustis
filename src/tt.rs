@@ -28,6 +28,12 @@ impl Strs {
 }
 
 pub struct Timetable {
+    pub flex: Array<u32>,
+    pub flex_area_off: Array<u32>,
+    pub flex_area_stops: Array<u32>,
+    pub flex_pickup_off: Array<u32>,
+    pub flex_pickup: Array<u32>,
+    pub flex_booking: Strs,
     pub dir: PathBuf,
     pub meta: SnapshotMeta,
     pub catalog: Catalog,
@@ -127,6 +133,12 @@ impl Timetable {
             tzs.push(tz);
         }
         let tt = Self {
+            flex: a!("flex"),
+            flex_area_off: a!("flex_area_off"),
+            flex_area_stops: a!("flex_area_stops"),
+            flex_pickup_off: a!("flex_pickup_off"),
+            flex_pickup: a!("flex_pickup"),
+            flex_booking: Strs::open(dir, "flex_booking", m)?,
             dir: dir.to_owned(),
             catalog,
             stop_route_off: a!("stop_route_off"),
@@ -200,6 +212,25 @@ impl Timetable {
         csr("foot_off", &self.foot_off, self.foot_to.len())?;
         csr("lb_in_off", &self.lb_in_off, self.lb_in_from.len())?;
         csr("rule_off", &self.rule_off, self.rule_secs.len())?;
+        csr(
+            "flex_pickup_off",
+            &self.flex_pickup_off,
+            self.flex_pickup.len(),
+        )?;
+        ensure!(
+            self.flex.len().is_multiple_of(crate::flex::WIDTH),
+            "flex row width"
+        );
+        ensure!(
+            self.flex_area_off.len() == self.flex.len() / crate::flex::WIDTH * 2 + 1,
+            "flex area count"
+        );
+        ensure!(
+            self.flex_area_off.first() == Some(&0)
+                && self.flex_area_off.last().copied() == Some(self.flex_area_stops.len() as u32)
+                && self.flex_area_off.windows(2).all(|w| w[0] < w[1]),
+            "flex area offsets"
+        );
         ensure!(
             self.route_stop_off.len() == nr + 1 && self.route_trip_off.len() == nr + 1,
             "route offsets"
@@ -259,6 +290,31 @@ impl Timetable {
             self.trip_bits.iter().all(|&b| (b as usize) < nb),
             "bitfield index out of range"
         );
+        let nf = self.flex.len() / crate::flex::WIDTH;
+        ensure!(
+            self.flex_pickup.iter().all(|&i| (i as usize) < nf),
+            "flex pickup index"
+        );
+        ensure!(
+            self.flex_area_stops.iter().all(|&i| (i as usize) < ns),
+            "flex stop index"
+        );
+        for f in self.flex.as_chunks::<{ crate::flex::WIDTH }>().0 {
+            ensure!(
+                f[0] <= f[1] && f[2] <= f[3] && f[4] >= crate::flex::BUFFER,
+                "flex windows/duration"
+            );
+            ensure!(
+                (f[5] as usize) < nb
+                    && (f[6] as usize) < self.tzs.len()
+                    && (f[7] as usize) < self.meta.n_route_infos,
+                "flex metadata index"
+            );
+            ensure!(
+                (f[8] as usize) < nf * 2 && (f[9] as usize) < nf * 2,
+                "flex area index"
+            );
+        }
         for r in 0..nr {
             for pos in 0..self.n_route_stops(r) {
                 ensure!(
@@ -285,6 +341,13 @@ impl Timetable {
             && self.bitfields[bits as usize * self.words + day / 64] >> (day % 64) & 1 == 1
     }
 
+    pub fn flex_service(&self, i: u32) -> &[u32] {
+        &self.flex[i as usize * crate::flex::WIDTH..(i as usize + 1) * crate::flex::WIDTH]
+    }
+    pub fn flex_area(&self, a: u32) -> &[u32] {
+        &self.flex_area_stops
+            [self.flex_area_off[a as usize] as usize..self.flex_area_off[a as usize + 1] as usize]
+    }
     pub fn n_route_stops(&self, r: usize) -> usize {
         (self.route_stop_off[r + 1] - self.route_stop_off[r]) as usize
     }
@@ -313,7 +376,7 @@ impl Timetable {
             && (lo..=hi.min(self.days.saturating_sub(1))).any(|d| self.active(b, d))
     }
     pub fn served(&self, s: usize) -> bool {
-        self.stop_route_off[s + 1] > self.stop_route_off[s]
+        self.stop_days[s] != crate::build::NONE
     }
     pub fn footpaths(&self, s: u32) -> impl Iterator<Item = (u32, u32)> + '_ {
         self.footpaths_flagged(s).map(|(t, secs, _)| (t, secs))

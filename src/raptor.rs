@@ -76,6 +76,7 @@ pub enum From {
 
 #[derive(Clone, Copy, Debug)]
 pub struct RideLabel {
+    pub flex: Option<(u32, u32, u32)>, // service, origin stop, departure
     pub arr: u32,
     pub route: u32,
     /// Global trip index.
@@ -95,6 +96,8 @@ pub struct WalkLabel {
 }
 
 pub struct Query<'a> {
+    pub allow_flex: bool,
+    pub allow_timed: bool,
     pub sources: &'a [(u32, u32)],
     pub targets: &'a [(u32, u32)],
     /// Earliest departure from the rider's position (relative seconds).
@@ -110,6 +113,14 @@ pub struct Query<'a> {
 
 #[derive(Clone, Debug)]
 pub enum Step {
+    Flex {
+        service: u32,
+        day: u32,
+        from: u32,
+        to: u32,
+        dep: u32,
+        arr: u32,
+    },
     /// Rider's own walk to a source stop.
     Access {
         stop: u32,
@@ -374,6 +385,9 @@ impl Search<'_, '_, '_> {
             marked.sort_unstable();
             marked.dedup();
             for &s in &marked {
+                if !self.q.allow_timed {
+                    continue;
+                }
                 let (a, b) = (
                     tt.stop_route_off[s as usize] as usize,
                     tt.stop_route_off[s as usize + 1] as usize,
@@ -393,6 +407,9 @@ impl Search<'_, '_, '_> {
                 }
                 self.stats.routes_scanned += 1;
                 self.scan_route(k, r, p0, &mut improved);
+            }
+            if self.q.allow_flex {
+                self.scan_flex(k, &marked, &mut improved);
             }
             // Footpaths and ready times from the improved ride labels.
             let mut next: Vec<u32> = Vec::new();
@@ -444,22 +461,97 @@ impl Search<'_, '_, '_> {
         }
     }
 
+    fn scan_flex(&mut self, k: usize, marked: &[u32], improved: &mut Vec<u32>) {
+        let tt = self.tt;
+        for &s in marked {
+            let Some((ready, from, a_stop, a_arr, a_trip, a_route)) = self.ready(k - 1, s) else {
+                continue;
+            };
+            for &service in &tt.flex_pickup[tt.flex_pickup_off[s as usize] as usize
+                ..tt.flex_pickup_off[s as usize + 1] as usize]
+            {
+                let f = tt.flex_service(service);
+                let rules = self.rules_for(s, a_stop, a_trip, a_route);
+                let ready = match rules.as_ref().and_then(|rs| best_rule(rs, f[10], f[7])) {
+                    Some(rule) if rule.secs == FORBIDDEN => continue,
+                    Some(rule) => a_arr.saturating_add(rule.secs),
+                    None => match ready {
+                        Some(t) => t,
+                        None => continue,
+                    },
+                };
+                for day in 0..tt.days {
+                    let base = tt.base[f[6] as usize][day];
+                    if base.saturating_add(f[1]) < ready
+                        || base.saturating_add(f[0]) >= self.bound
+                        || !tt.active(f[5], day)
+                    {
+                        continue;
+                    }
+                    let dep = ready.max(base + f[0]);
+                    let arr = dep.saturating_add(f[4]).max(base + f[2]);
+                    if dep > base + f[1] || arr > base + f[3] {
+                        continue;
+                    }
+                    for &to in tt.flex_area(f[9]) {
+                        if self.inserted > self.q.max_labels {
+                            self.stats.truncated = true;
+                            return;
+                        }
+                        if self.best_ride.get(to).is_none_or(|b| arr < b) && !self.pruned(to, arr) {
+                            self.best_ride.set(to, arr);
+                            self.inserted += 1;
+                            self.ride[k].insert(
+                                to,
+                                RideLabel {
+                                    flex: Some((service, s, dep)),
+                                    arr,
+                                    route: NONE,
+                                    trip: NONE,
+                                    day: day as u32,
+                                    board_pos: 0,
+                                    alight_pos: 0,
+                                    board_from: from,
+                                },
+                            );
+                            improved.push(to);
+                            self.note_target(k, to, arr, From::Ride);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// Ready time at `s` from round `k` labels plus alight context for rules:
     /// (ready, from, alight stop, alight arrival, alight trip).
     fn ready(&self, k: usize, s: u32) -> Option<(Option<u32>, From, u32, u32, u32, u32)> {
         let tt = self.tt;
+        let context = |l: &RideLabel| {
+            if let Some((service, _, _)) = l.flex {
+                let f = tt.flex_service(service);
+                (f[10], f[7])
+            } else {
+                (
+                    tt.trip_gtfs[l.trip as usize],
+                    tt.route_info[l.route as usize],
+                )
+            }
+        };
         let mut best: Option<(Option<u32>, From, u32, u32, u32, u32)> = None;
         if let Some(l) = self.ride[k].get(&s) {
             let ct = tt.stop_change[s as usize];
             let ready = (ct != FORBIDDEN).then(|| l.arr.saturating_add(ct));
-            best = Some((ready, From::Ride, s, l.arr, l.trip, l.route));
+            let (g, info) = context(l);
+            best = Some((ready, From::Ride, s, l.arr, g, info));
         }
         if let Some(w) = self.walk[k].get(&s) {
             let (stop, arr, trip, route) = if k == 0 {
                 (NONE, 0, NONE, NONE)
             } else {
                 let l = self.ride[k][&w.from];
-                (w.from, l.arr, l.trip, l.route)
+                let (g, info) = context(&l);
+                (w.from, l.arr, g, info)
             };
             if best.is_none_or(|b| b.0.is_none_or(|r| w.ready < r)) {
                 best = Some((Some(w.ready), From::Walk, stop, arr, trip, route));
@@ -489,6 +581,7 @@ impl Search<'_, '_, '_> {
                     self.ride[k].insert(
                         s,
                         RideLabel {
+                            flex: None,
                             arr: a,
                             route: r,
                             trip: trip0 + j as u32,
@@ -558,10 +651,7 @@ impl Search<'_, '_, '_> {
         if a == b || a_stop == NONE {
             return None;
         }
-        let (g, info) = (
-            tt.trip_gtfs[a_trip as usize],
-            tt.route_info[a_route as usize],
-        );
+        let (g, info) = (a_trip, a_route);
         let v: Vec<MatchedRule> = (a..b)
             .filter(|&i| {
                 tt.rule_from_stop[i] == a_stop
@@ -666,6 +756,20 @@ impl Search<'_, '_, '_> {
                 }
                 From::Ride => {
                     let l = self.ride[k].get(&stop)?;
+                    if let Some((service, from, dep)) = l.flex {
+                        steps.push(Step::Flex {
+                            service,
+                            day: l.day,
+                            from,
+                            to: stop,
+                            dep,
+                            arr: l.arr,
+                        });
+                        stop = from;
+                        kind = l.board_from;
+                        k = k.checked_sub(1)?;
+                        continue;
+                    }
                     steps.push(Step::Ride {
                         route: l.route,
                         trip: l.trip,

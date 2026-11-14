@@ -293,7 +293,9 @@ fn place_json(
 fn leg_json(ids: &Ids, l: &Leg, start: Option<[f64; 2]>, end: Option<[f64; 2]>) -> Value {
     let (dep, arr) = (utc(&l.departure_time), utc(&l.arrival_time));
     let transit = l.kind == LegKind::Transit;
-    let mode = if transit {
+    let mode = if l.mode.as_deref() == Some("flex") {
+        "FLEX"
+    } else if transit {
         mode(l.route_type.unwrap_or(u16::MAX))
     } else {
         "WALK"
@@ -336,6 +338,11 @@ fn leg_json(ids: &Ids, l: &Leg, start: Option<[f64; 2]>, end: Option<[f64; 2]>) 
             "length": geometry.len(),
         },
     });
+    if let Some(info) = &l.booking_info {
+        v["bookingRequired"] = json!(true);
+        v["bookingInfo"] = json!(info);
+        v["warnings"] = json!([format!("BOOKING: {info}")]);
+    }
     if transit {
         let line = l.line.clone().unwrap_or_default();
         v["interlineWithPreviousLeg"] = json!(false);
@@ -479,7 +486,13 @@ pub fn plan(snap: &Snapshot, q: &PlanQuery, body: &PlanBody) -> Result<Value, Er
         max_travel_seconds: MAX_TRAVEL_SECS,
         alternatives_within_seconds: SEARCH_WINDOW_SECS,
     };
-    let resp = snap.plan(&req)?;
+    let allow_flex = modes
+        .as_ref()
+        .is_some_and(|m| m.iter().any(|x| x == "FLEX" || x == "ODM"));
+    let allow_timed = modes
+        .as_ref()
+        .is_none_or(|m| m.iter().any(|x| x != "FLEX" && x != "ODM"));
+    let resp = snap.plan_with_modes(&req, allow_flex, allow_timed)?;
     let mut sorted: Vec<&Itinerary> = resp.itineraries.iter().collect();
     // MOTIS lists the journeys of the window by departure
     sorted.sort_by_key(|it| (it.departure, it.arrival));
@@ -488,12 +501,22 @@ pub fn plan(snap: &Snapshot, q: &PlanQuery, body: &PlanBody) -> Result<Value, Er
         // walking alone belongs to `direct` (directModes), never to `itineraries`
         .filter(|it| it.legs.iter().any(|l| l.kind == LegKind::Transit))
         .filter(|it| {
-            modes.as_ref().is_none_or(|m| {
-                it.legs
-                    .iter()
-                    .filter(|l| l.kind == LegKind::Transit)
-                    .all(|l| allowed(m, mode(l.route_type.unwrap_or(u16::MAX))))
-            })
+            (!it.legs.iter().any(|l| l.mode.as_deref() == Some("flex"))
+                || modes
+                    .as_ref()
+                    .is_some_and(|m| m.iter().any(|x| x == "FLEX" || x == "ODM")))
+                && modes.as_ref().is_none_or(|m| {
+                    it.legs
+                        .iter()
+                        .filter(|l| l.kind == LegKind::Transit)
+                        .all(|l| {
+                            if l.mode.as_deref() == Some("flex") {
+                                m.iter().any(|x| x == "FLEX" || x == "ODM")
+                            } else {
+                                allowed(m, mode(l.route_type.unwrap_or(u16::MAX)))
+                            }
+                        })
+                })
         })
         .take(wanted)
         .map(|it| itinerary_json(&ids, it, start, end))

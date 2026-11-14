@@ -63,6 +63,30 @@ impl Feed {
         }
     }
 
+    pub fn bytes(&mut self, name: &str) -> Result<Option<Vec<u8>>> {
+        let mut bytes = Vec::new();
+        match self {
+            Self::Dir(d) => {
+                let p = d.join(name);
+                if !p.exists() {
+                    return Ok(None);
+                }
+                bytes = std::fs::read(p)?;
+            }
+            Self::Zip(z) => {
+                let Some(full) = z
+                    .file_names()
+                    .find(|n| *n == name || n.ends_with(&format!("/{name}")))
+                    .map(str::to_owned)
+                else {
+                    return Ok(None);
+                };
+                z.by_name(&full)?.read_to_end(&mut bytes)?;
+            }
+        }
+        Ok(Some(bytes))
+    }
+
     /// Streams the rows of `name` to `f(cols, record)`. Returns `false` if the
     /// file is absent.
     pub fn rows(

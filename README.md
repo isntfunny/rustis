@@ -114,7 +114,14 @@ so the container limit has to cover the update run, not the server.
 
 ## Limits
 
-GTFS-Flex is not routed; transfer types 1/5 are not exploited; no de-duplication of
+GTFS-Flex groups and Polygon/MultiPolygon zones serve the feed's stops within each
+area. Rides use pickup/drop-off windows, calendars and a conservative estimate:
+maximum stop-to-stop distance × 1.5 at 30 km/h + 5 minutes (minimum 5 minutes).
+This is not an operator travel-time guarantee; booking contact/notice is reported
+in `BOOKING:` warnings. MOTIS clients must explicitly request `FLEX` or `ODM`.
+Mixed timed/area trips, empty areas and unsupported flex shapes are reported with
+skip reasons. Zone routing does not offer arbitrary door-to-door endpoints.
+Transfer types 1/5 are not exploited; no de-duplication of
 the same service across feeds. NeTEx: the French (SNCF) and Italian (Trenitalia)
 profiles are imported; other profiles, reservation flags and NeTEx interchanges are not
 yet supported. Walks are straight-line at 1.2 m/s (no street network).

@@ -138,6 +138,9 @@ pub struct Leg {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub intermediate_stops: Vec<Stop>,
     /// Boarding needs a phone booking / driver arrangement (pickup_type 2/3).
+    /// Operator notice/contact details for a flex ride (booking is not made by Rustis).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub booking_info: Option<String>,
     pub pickup_booking_required: bool,
     /// Alighting needs a phone booking / driver arrangement (drop_off_type 2/3).
     pub drop_off_booking_required: bool,

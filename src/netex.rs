@@ -657,6 +657,7 @@ pub(super) fn read(p: &mut Parser<'_>, spec: &FeedSpec) -> Result<FeedData> {
         report.trips,
     );
     Ok(FeedData {
+        flex: Vec::new(),
         stop_tz: vec![tz; stops.len()],
         report,
         stops,

@@ -127,7 +127,7 @@ fn flex_trips_are_skipped_flagged_and_the_rest_is_routed() {
     )
     .unwrap();
     assert_eq!(
-        m.feeds[0].skipped.get("flex_or_unknown_stop_trips"),
+        m.feeds[0].skipped.get("trips_unknown_stop_or_area"),
         Some(&1)
     );
     let s = Snapshot::open(&tmp.path().join("s")).unwrap();

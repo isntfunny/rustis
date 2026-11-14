@@ -34,7 +34,7 @@ pub const FLAG_DROP_OFF_BOOKING: u8 = 8;
 /// Change time value meaning "no transfer possible at this stop" (type 3).
 pub const FORBIDDEN: u32 = u32::MAX;
 pub const NONE: u32 = u32::MAX;
-pub const SNAPSHOT_VERSION: u32 = 6;
+pub const SNAPSHOT_VERSION: u32 = 7;
 /// Bit set in `foot_secs` for footpaths given explicitly by transfers.txt
 /// (the walk is not raised to the change time of the stop it starts at).
 pub const FOOT_EXPLICIT: u32 = 1 << 31;
@@ -98,6 +98,8 @@ pub struct FeedReport {
     pub trips: u64,
     pub routes: u64,
     pub stop_times: u64,
+    #[serde(default)]
+    pub flex_services: u64,
     pub timezone: String,
     pub service_range: Option<[String; 2]>,
     /// Counters of everything not routed or only partly honoured.
@@ -163,6 +165,7 @@ struct Pattern {
 
 /// Everything one feed contributes; committed only if the whole feed parsed.
 struct FeedData {
+    flex: Vec<crate::flex::Service>,
     report: FeedReport,
     stops: Vec<Stop>,
     stop_tz: Vec<u16>,
@@ -215,6 +218,7 @@ pub fn parse_feed(spec: &FeedSpec, opts: &BuildOptions) -> Result<ParsedFeed> {
 }
 
 pub struct Builder {
+    flex: Vec<crate::flex::Service>,
     opts: BuildOptions,
     dir: PathBuf,
     words: usize,
@@ -325,6 +329,7 @@ impl Builder {
         );
         let words = (opts.horizon_days as usize + 1).div_ceil(64);
         Ok(Self {
+            flex: Vec::new(),
             words,
             tz_names: Vec::new(),
             stops: Vec::new(),
@@ -749,8 +754,14 @@ impl Parser<'_> {
             Ok(())
         })?;
 
+        let areas = crate::flex::areas(&mut feed, &stops, &stop_idx)?;
+        let bookings = crate::flex::bookings(&mut feed)?;
+        let mut flex = Vec::new();
         // stop_times.txt, trip by trip.
         struct Row {
+            area: Option<Vec<u32>>,
+            window: Option<(u32, u32)>,
+            booking: String,
             seq: u32,
             stop: u32,
             arr: Option<u32>,
@@ -794,7 +805,7 @@ impl Parser<'_> {
                 );
             }
             if bad {
-                *skip.entry("flex_or_unknown_stop_trips".into()).or_default() += 1;
+                *skip.entry("trips_unknown_stop_or_area".into()).or_default() += 1;
                 return Ok(());
             }
             let mut take = take;
@@ -809,6 +820,85 @@ impl Parser<'_> {
                 *skip.entry("trips_unknown_service".into()).or_default() += 1;
                 return Ok(());
             };
+            if take.iter().any(|r| r.window.is_some() || r.area.is_some()) {
+                let reason = if take.iter().any(|r| r.window.is_none() || r.area.is_none()) {
+                    Some("flex_mixed_or_missing_window_trips")
+                } else if take.iter().any(|r| r.window.is_some_and(|(a, b)| a > b)) {
+                    Some("flex_invalid_window_trips")
+                } else if take
+                    .iter()
+                    .any(|r| r.area.as_ref().is_some_and(|a| a.is_empty()))
+                {
+                    Some("flex_empty_area_trips")
+                } else if freqs.contains_key(trip_id) {
+                    Some("flex_frequency_trips")
+                } else if excl_booking {
+                    Some("flex_booking_excluded_trips")
+                } else {
+                    None
+                };
+                if let Some(reason) = reason {
+                    *skip.entry(reason.into()).or_default() += 1;
+                    return Ok(());
+                }
+                let base_bits = &services[service];
+                if base_bits.iter().all(|&w| w == 0) {
+                    *skip
+                        .entry("flex_not_running_in_horizon".into())
+                        .or_default() += 1;
+                    return Ok(());
+                }
+                let bits = builder.bitfield(base_bits);
+                let before = flex.len();
+                for (i, a) in take
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, r)| r.flags & FLAG_NO_PICKUP == 0)
+                {
+                    for b in take[i + 1..]
+                        .iter()
+                        .filter(|r| r.flags & FLAG_NO_DROP_OFF == 0)
+                    {
+                        let pickup = a.area.as_ref().unwrap();
+                        let dropoff = b.area.as_ref().unwrap();
+                        let Some(duration) = crate::flex::duration(pickup, dropoff, &stops) else {
+                            *skip
+                                .entry("flex_pair_missing_coordinates".into())
+                                .or_default() += 1;
+                            continue;
+                        };
+                        let (start, end) = a.window.unwrap();
+                        let (arrival_start, arrival_end) = b.window.unwrap();
+                        if start.saturating_add(duration).max(arrival_start) > arrival_end {
+                            *skip
+                                .entry("flex_infeasible_window_pairs".into())
+                                .or_default() += 1;
+                            continue;
+                        }
+                        builder.max_time = builder.max_time.max(arrival_end).max(end);
+                        flex.push(crate::flex::Service {
+                            pickup: pickup.clone(),
+                            dropoff: dropoff.clone(),
+                            start,
+                            end,
+                            arrival_start,
+                            arrival_end,
+                            duration,
+                            bits,
+                            tz,
+                            info: meta.info,
+                            gtfs: meta.gtfs,
+                            booking: format!("{}; {}", a.booking, b.booking),
+                        });
+                    }
+                }
+                if flex.len() == before {
+                    *skip
+                        .entry("flex_trips_without_usable_pairs".into())
+                        .or_default() += 1;
+                }
+                return Ok(());
+            }
             // Times: interpolate missing ones linearly by straight-line distance.
             let n = take.len();
             let mut t: Vec<(u32, u32)> = Vec::with_capacity(n);
@@ -958,14 +1048,29 @@ impl Parser<'_> {
                 bad_trip = false;
             }
             let sid = field(r, c.get("stop_id"));
-            let window = !field(r, c.get("start_pickup_drop_off_window")).is_empty();
-            let Some(&stop) = stop_idx.get(sid) else {
-                bad_trip = true; // GTFS-Flex location/group or unknown stop
-                return Ok(());
+            let start = parse_time(field(r, c.get("start_pickup_drop_off_window")))?;
+            let end = parse_time(field(r, c.get("end_pickup_drop_off_window")))?;
+            let group = text(r, c.get("location_group_id"));
+            let zone = text(r, c.get("location_id"));
+            let area = if !group.is_empty() {
+                areas.get(&format!("g:{group}")).cloned()
+            } else if !zone.is_empty() {
+                areas.get(&format!("z:{zone}")).cloned()
+            } else if start.is_some() || end.is_some() {
+                stop_idx.get(sid).map(|&s| vec![s])
+            } else {
+                None
             };
-            if window {
+            let stop = stop_idx.get(sid).copied().unwrap_or(NONE);
+            if stop == NONE && area.is_none() {
                 bad_trip = true;
             }
+            let window = start.zip(end);
+            let booking = ["pickup_booking_rule_id", "drop_off_booking_rule_id"]
+                .iter()
+                .filter_map(|k| bookings.get(&text(r, c.get(k))).cloned())
+                .collect::<Vec<_>>()
+                .join("; ");
             let seq: u32 = std::str::from_utf8(field(r, c.get("stop_sequence")))?
                 .parse()
                 .context("stop_sequence")?;
@@ -981,6 +1086,9 @@ impl Parser<'_> {
                 FLAG_DROP_OFF_BOOKING,
             );
             rows.push(Row {
+                area,
+                window,
+                booking,
                 seq,
                 stop,
                 arr,
@@ -1139,10 +1247,24 @@ impl Parser<'_> {
             }
             Ok(())
         })?;
+        // Retain trip identity only where transfer rules distinguish it; otherwise
+        // identical flex trips can share one service safely.
+        for f in &mut flex {
+            if !rules
+                .iter()
+                .any(|r| r.from_trip == f.gtfs || r.to_trip == f.gtfs)
+            {
+                f.gtfs = NONE;
+            }
+        }
+        let mut seen = HashSet::new();
+        flex.retain(|f| seen.insert(f.clone()));
+        report.flex_services = flex.len() as u64;
         report.transfer_rules = tr;
         report.skipped = skip;
         report.imported = true;
         Ok(FeedData {
+            flex,
             report,
             stops,
             stop_tz,
@@ -1185,6 +1307,18 @@ impl Builder {
             .chunks_exact(words)
             .map(|b| self.bitfield(b))
             .collect();
+        for mut f in d.flex {
+            for s in f.pickup.iter_mut().chain(f.dropoff.iter_mut()) {
+                *s += base;
+            }
+            f.bits = bits_map[f.bits as usize];
+            f.tz = tz_map[f.tz as usize];
+            f.info += info_base;
+            if f.gtfs != NONE {
+                f.gtfs += gtfs_base;
+            }
+            self.flex.push(f);
+        }
         self.max_time = self.max_time.max(d.max_time);
         let feed_no = self.feeds.len() as u32;
         self.stop_feed
@@ -1381,6 +1515,77 @@ impl Builder {
                 stop_days[s as usize] = self.bitfield(&acc2);
             }
         }
+        let mut flex_rows = Vec::<u32>::new();
+        let mut area_off = vec![0u32];
+        let mut area_stops = Vec::new();
+        let mut pickups = Vec::new();
+        let mut booking = StrWriter::create(&dir, "flex_booking")?;
+        for (i, f) in self.flex.iter().enumerate() {
+            flex_rows.extend([
+                f.start,
+                f.end,
+                f.arrival_start,
+                f.arrival_end,
+                f.duration,
+                f.bits,
+                f.tz as u32,
+                f.info,
+                2 * i as u32,
+                2 * i as u32 + 1,
+                f.gtfs,
+            ]);
+            booking.push(&f.booking)?;
+            for area in [&f.pickup, &f.dropoff] {
+                area_stops.extend_from_slice(area);
+                area_off.push(area_stops.len() as u32);
+            }
+            for &s in &f.pickup {
+                pickups.push((s, i as u32));
+            }
+            let hub = f.pickup[0];
+            for &s in &f.pickup {
+                self.lb_edges.push((s, hub, 0));
+            }
+            for &s in &f.dropoff {
+                self.lb_edges.push((hub, s, f.duration));
+            }
+        }
+        for i in 0..self.flex.len() {
+            let f = self.flex[i].clone();
+            for &s in f.pickup.iter().chain(&f.dropoff) {
+                served[s as usize] = true;
+                let mut bits = self.bitfield_table
+                    [f.bits as usize * self.words..(f.bits as usize + 1) * self.words]
+                    .to_vec();
+                let old = stop_days[s as usize];
+                if old != NONE {
+                    for (w, x) in bits.iter_mut().zip(
+                        &self.bitfield_table
+                            [old as usize * self.words..(old as usize + 1) * self.words],
+                    ) {
+                        *w |= x;
+                    }
+                }
+                stop_days[s as usize] = self.bitfield(&bits);
+            }
+        }
+        pickups.sort_unstable();
+        write_all(&dir, "flex", &flex_rows, m)?;
+        write_all(&dir, "flex_area_off", &area_off, m)?;
+        write_all(&dir, "flex_area_stops", &area_stops, m)?;
+        write_all(
+            &dir,
+            "flex_pickup_off",
+            &csr_offsets(n_stops, pickups.iter().map(|x| x.0)),
+            m,
+        )?;
+        write_all(
+            &dir,
+            "flex_pickup",
+            &pickups.iter().map(|x| x.1).collect::<Vec<_>>(),
+            m,
+        )?;
+        booking.finish(m)?;
         write_all(&dir, "stop_route_off", &off, m)?;
         write_all(
             &dir,
@@ -1605,7 +1810,7 @@ impl Builder {
         let empty: Vec<_> = self
             .feeds
             .iter()
-            .filter(|f| f.imported && f.trips == 0)
+            .filter(|f| f.imported && f.trips == 0 && f.flex_services == 0)
             .map(|f| f.name.clone())
             .collect();
         if !empty.is_empty() {
@@ -1615,20 +1820,12 @@ impl Builder {
                 empty.join(", ")
             ));
         }
-        let flex: u64 = self
-            .feeds
-            .iter()
-            .map(|f| {
-                f.skipped
-                    .get("flex_or_unknown_stop_trips")
-                    .copied()
-                    .unwrap_or(0)
-            })
-            .sum();
-        if flex > 0 {
-            warnings.push(format!(
-                "{flex} GTFS-Flex/unknown-stop trip(s) are not routed"
-            ));
+        for f in &self.feeds {
+            for (reason, count) in &f.skipped {
+                if reason.starts_with("flex_") || reason == "trips_unknown_stop_or_area" {
+                    warnings.push(format!("GTFS-Flex {}: {reason}={count}", f.name));
+                }
+            }
         }
         let ignored: u64 = self
             .feeds

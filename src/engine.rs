@@ -182,6 +182,15 @@ impl Snapshot {
     }
 
     pub fn plan(&self, q: &PlanRequest) -> Result<PlanResponse, Error> {
+        self.plan_with_modes(q, true, true)
+    }
+
+    pub(crate) fn plan_with_modes(
+        &self,
+        q: &PlanRequest,
+        allow_flex: bool,
+        allow_timed: bool,
+    ) -> Result<PlanResponse, Error> {
         if q.max_transfers > MAX_TRANSFERS {
             return Err(Error::invalid(format!(
                 "max_transfers must be ≤ {MAX_TRANSFERS}"
@@ -251,7 +260,11 @@ impl Snapshot {
         let rides = |found: &[(Journey, u32)]| {
             found
                 .iter()
-                .filter(|(j, _)| j.steps.iter().any(|s| matches!(s, Step::Ride { .. })))
+                .filter(|(j, _)| {
+                    j.steps
+                        .iter()
+                        .any(|s| matches!(s, Step::Ride { .. } | Step::Flex { .. }))
+                })
                 .count()
         };
         'outer: while rides(&found) < q.max_results && searches < 3 * q.max_results {
@@ -272,6 +285,8 @@ impl Snapshot {
             };
             for w in windows {
                 let query = Query {
+                    allow_flex,
+                    allow_timed,
                     sources: &from.stops,
                     targets: &to.stops,
                     depart,
@@ -322,7 +337,10 @@ impl Snapshot {
                 // A walk without any ride can leave at any time: it must not
                 // pin the next search to `depart + 1` (1 s steps until the
                 // search budget is spent).
-                if j.steps.iter().any(|s| matches!(s, Step::Ride { .. })) {
+                if j.steps
+                    .iter()
+                    .any(|s| matches!(s, Step::Ride { .. } | Step::Flex { .. }))
+                {
                     next = next.min(dep);
                 }
                 let sig = signature(&j);
@@ -377,6 +395,14 @@ impl Snapshot {
                  alternatives) may exist that were not explored.",
                 self.max_labels
             ));
+        }
+        for leg in kept.iter().flat_map(|it| &it.legs) {
+            if let Some(info) = &leg.booking_info {
+                let warning = format!("BOOKING: {info}");
+                if !warnings.contains(&warning) {
+                    warnings.push(warning);
+                }
+            }
         }
         if kept.iter().any(|i| i.booking_required) {
             warnings.push(
@@ -448,6 +474,7 @@ impl Snapshot {
                     let _ = d;
                     return t.saturating_sub(before);
                 }
+                Step::Flex { dep, .. } => return dep.saturating_sub(before),
                 Step::Egress { .. } => {}
             }
         }
@@ -514,6 +541,7 @@ impl Snapshot {
             drop_off_booking_required: false,
             geometry,
             geometry_source: "stops",
+            booking_info: None,
         }
     }
 
@@ -522,7 +550,10 @@ impl Snapshot {
         let coord = |s: u32| tt.catalog.coord(s as usize);
         // Absolute times: rides fix the clock; walks after a ride start at its
         // arrival; walks before the first ride end at its departure.
-        let first_ride = j.steps.iter().position(|s| matches!(s, Step::Ride { .. }));
+        let first_ride = j
+            .steps
+            .iter()
+            .position(|s| matches!(s, Step::Ride { .. } | Step::Flex { .. }));
         let mut legs: Vec<Leg> = Vec::new();
         let mut clock: Option<u32> = None;
         // backward pass for the pre-ride part
@@ -534,6 +565,7 @@ impl Snapshot {
                 board_pos,
                 ..
             } => self.ride_times(route, trip, day, board_pos, board_pos).0,
+            Step::Flex { dep, .. } => dep,
             _ => unreachable!(),
         });
         let pre: u32 = j.steps[..first_ride.unwrap_or(j.steps.len())]
@@ -587,6 +619,44 @@ impl Snapshot {
                         [coord(from), coord(to)].into_iter().flatten().collect(),
                     ));
                     t += secs;
+                }
+                Step::Flex {
+                    service,
+                    from,
+                    to,
+                    dep,
+                    arr,
+                    ..
+                } => {
+                    if dep < t || clock.is_some_and(|c| dep < c) {
+                        return None;
+                    }
+                    let f = tt.flex_service(service);
+                    let info = f[7] as usize;
+                    let mut leg = self.leg(
+                        LegKind::Transit,
+                        Some(from),
+                        Some(to),
+                        dep,
+                        arr,
+                        to_local,
+                        [coord(from), coord(to)].into_iter().flatten().collect(),
+                    );
+                    leg.route_id = Some(tt.route_info_id.get(info).to_owned());
+                    leg.line = Some(tt.route_info_line.get(info).to_owned());
+                    leg.mode = Some("flex".into());
+                    leg.route_type = Some(tt.route_info_type[info]);
+                    leg.agency = Some(tt.route_info_agency.get(info).to_owned());
+                    leg.booking_info = Some(tt.flex_booking.get(service as usize).to_owned());
+                    leg.pickup_booking_required = true;
+                    leg.drop_off_booking_required = true;
+                    legs.push(leg);
+                    if rides > 0 {
+                        transfers += 1;
+                    }
+                    rides += 1;
+                    t = arr;
+                    clock = Some(arr);
                 }
                 Step::Ride {
                     route,
@@ -920,6 +990,13 @@ fn signature(j: &Journey) -> Vec<(u32, u32, u32, u32)> {
                 alight_pos,
                 ..
             } => (trip, day, board_pos, alight_pos),
+            Step::Flex {
+                service,
+                day,
+                from,
+                to,
+                ..
+            } => (u32::MAX - 3 - service, day, from, to),
             Step::Walk { from, to, .. } => (u32::MAX, from, to, 0),
             Step::Access { stop, .. } => (u32::MAX - 1, stop, 0, 0),
             Step::Egress { stop, .. } => (u32::MAX - 2, stop, 0, 0),
