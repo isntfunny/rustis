@@ -80,6 +80,8 @@ POST /v1/plan
 
 ## Container
 
+Prebuilt images: `ghcr.io/isntfunny/rustis:latest` and `:<commit>` (GitHub Actions on every push to `main`).
+
 ```sh
 docker build -t rustis .
 # serve: /data/current is the snapshot symlink, reloaded every 60 s
