@@ -16,7 +16,7 @@ replacement for [MOTIS](https://github.com/motis-project/motis) where RAM is sca
 
 > Status: early. The MOTIS-compatible subset (`/api/v6/plan` GET/POST incl. offsets,
 > `radius`, `transitModes`, and `/api/v6/map/stops`) is contract-tested against MOTIS
-> 2.11. Also provided: `/api/v1/geocode` (stations only), `/api/v6/stoptimes` and
+> 2.11, plus `arriveBy=true` (latest departures arriving by `time`). Also provided: `/api/v1/geocode` (stations only), `/api/v6/stoptimes` and
 > `/api/v6/trip` (schedule only, see below); other MOTIS endpoints are not.
 
 ## Commands

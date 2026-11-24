@@ -433,9 +433,6 @@ fn merge_walks(legs: &[Leg]) -> Vec<Leg> {
 
 /// `/api/v6/plan`.
 pub fn plan(snap: &Snapshot, q: &PlanQuery, body: &PlanBody) -> Result<Value, Error> {
-    if q.arrive_by == Some(true) {
-        return Err(Error::invalid("arriveBy=true is not supported"));
-    }
     let ids = Ids::new(snap);
     let radius = q.radius.unwrap_or(DEFAULT_RADIUS_M);
     if !(radius.is_finite() && radius > 0.0 && radius <= MAX_RADIUS_M) {
@@ -493,68 +490,80 @@ pub fn plan(snap: &Snapshot, q: &PlanQuery, body: &PlanBody) -> Result<Value, Er
         .stop_timezone(&from[0].stop_id)
         .ok_or_else(|| Error::invalid("unknown origin stop"))?;
     let tz = jiff::tz::TimeZone::get(tz_name).map_err(|e| Error::invalid(e.to_string()))?;
-    let local = time.to_zoned(tz.clone());
-    let midnight = local
-        .date()
-        .at(0, 0, 0, 0)
-        .to_zoned(tz)
-        .map_err(|e| Error::invalid(e.to_string()))?;
-    let departure = (time.as_second() - midnight.timestamp().as_second()).max(0) as u32;
-    let req = PlanRequest {
-        date: local.date().to_string(),
-        departure,
-        from,
-        to,
-        max_transfers: q
-            .max_transfers
-            .unwrap_or(DEFAULT_MAX_TRANSFERS)
-            .min(MAX_TRANSFERS),
-        max_results: wanted,
-        max_travel_seconds: MAX_TRAVEL_SECS,
-        alternatives_within_seconds: SEARCH_WINDOW_SECS,
-    };
     let allow_flex = modes
         .as_ref()
         .is_some_and(|m| m.iter().any(|x| x == "FLEX" || x == "ODM"));
     // MOTIS applies transitModes in the search: a journey restricted to
     // regional trains is found even if a faster ICE journey exists
     let type_ok = |t: u16| modes.as_ref().is_none_or(|m| allowed(m, mode(t)));
-    let resp = snap.plan_with_modes(
-        &req,
-        allow_flex,
-        modes.is_some().then_some(&type_ok as &dyn Fn(u16) -> bool),
-        q.deutschlandticket.unwrap_or(false),
-    )?;
-    let mut sorted: Vec<&Itinerary> = resp.itineraries.iter().collect();
+    // one forward search from `time`, arriving within `max_travel`
+    let run = |time: jiff::Timestamp, arrive_by: bool| -> Result<Vec<Itinerary>, Error> {
+        let local = time.to_zoned(tz.clone());
+        let midnight = local
+            .date()
+            .at(0, 0, 0, 0)
+            .to_zoned(tz.clone())
+            .map_err(|e| Error::invalid(e.to_string()))?;
+        let departure = (time.as_second() - midnight.timestamp().as_second()).max(0) as u32;
+        let req = PlanRequest {
+            date: local.date().to_string(),
+            departure,
+            from: from.clone(),
+            to: to.clone(),
+            max_transfers: q
+                .max_transfers
+                .unwrap_or(DEFAULT_MAX_TRANSFERS)
+                .min(MAX_TRANSFERS),
+            max_results: wanted,
+            max_travel_seconds: MAX_TRAVEL_SECS,
+            alternatives_within_seconds: SEARCH_WINDOW_SECS,
+        };
+        let resp = snap.plan_with_modes(
+            &req,
+            allow_flex,
+            modes.is_some().then_some(&type_ok as &dyn Fn(u16) -> bool),
+            q.deutschlandticket.unwrap_or(false),
+            arrive_by,
+        )?;
+        Ok(resp
+            .itineraries
+            .into_iter()
+            // walking alone belongs to `direct` (directModes), never to `itineraries`
+            .filter(|it| it.legs.iter().any(|l| l.kind == LegKind::Transit))
+            .filter(|it| {
+                (!it.legs.iter().any(|l| l.mode.as_deref() == Some("flex")) || allow_flex)
+                    && modes.as_ref().is_none_or(|m| {
+                        it.legs
+                            .iter()
+                            .filter(|l| l.kind == LegKind::Transit)
+                            .all(|l| {
+                                if l.mode.as_deref() == Some("flex") {
+                                    allow_flex
+                                } else {
+                                    allowed(m, mode(l.route_type.unwrap_or(u16::MAX)))
+                                }
+                            })
+                    })
+            })
+            .collect())
+    };
+    // arriveBy: `time` is the deadline; the journeys leaving latest
+    let mut sorted = run(time, q.arrive_by == Some(true))?;
     // MOTIS lists the journeys of the window by departure
-    sorted.sort_by_key(|it| (it.departure, it.arrival));
+    sorted.sort_by_key(|it| (unix(&it.departure_time), unix(&it.arrival_time)));
     let its: Vec<Value> = sorted
-        .into_iter()
-        // walking alone belongs to `direct` (directModes), never to `itineraries`
-        .filter(|it| it.legs.iter().any(|l| l.kind == LegKind::Transit))
-        .filter(|it| {
-            (!it.legs.iter().any(|l| l.mode.as_deref() == Some("flex"))
-                || modes
-                    .as_ref()
-                    .is_some_and(|m| m.iter().any(|x| x == "FLEX" || x == "ODM")))
-                && modes.as_ref().is_none_or(|m| {
-                    it.legs
-                        .iter()
-                        .filter(|l| l.kind == LegKind::Transit)
-                        .all(|l| {
-                            if l.mode.as_deref() == Some("flex") {
-                                m.iter().any(|x| x == "FLEX" || x == "ODM")
-                            } else {
-                                allowed(m, mode(l.route_type.unwrap_or(u16::MAX)))
-                            }
-                        })
-                })
-        })
+        .iter()
         .take(wanted)
         .map(|it| itinerary_json(&ids, it, start, end))
         .collect();
     out["itineraries"] = Value::Array(its);
     Ok(out)
+}
+
+fn unix(rfc3339: &str) -> i64 {
+    rfc3339
+        .parse::<jiff::Timestamp>()
+        .map_or(0, |t| t.as_second())
 }
 
 /// `/api/v6/map/stops`: served stops inside the box.

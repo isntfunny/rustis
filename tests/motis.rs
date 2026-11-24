@@ -161,7 +161,6 @@ async fn transit_modes_filter_and_unsupported_parameters() {
     .await;
     assert!(!json["itineraries"].as_array().unwrap().is_empty());
     for uri in [
-        format!("/api/v6/plan?fromPlace=A&toPlace=C&time={T0}&arriveBy=true"),
         format!("/api/v6/plan?fromPlace=nope&toPlace=C&time={T0}"),
         "/api/v6/plan?fromPlace=A&toPlace=C&time=yesterday".to_owned(),
     ] {
@@ -200,4 +199,36 @@ async fn map_stops_lists_served_stops_in_the_box() {
     );
     let (status, _) = call(&app, get("/api/v6/map/stops?min=x&max=50,8")).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn arrive_by_returns_latest_departures() {
+    let (_tmp, app) = app();
+    let plan = |t: &str, n: usize| {
+        format!("/api/v6/plan?fromPlace=A&toPlace=C&time={t}&arriveBy=true&numItineraries={n}")
+    };
+    // arrive by 08:30: bus 1 + bus 2 (08:00 → 08:25); the slow bus is too late
+    let (status, json) = call(&app, get(&plan("2026-11-16T07:30:00Z", 3))).await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    let its = json["itineraries"].as_array().unwrap();
+    assert!(!its.is_empty());
+    assert!(
+        its.iter()
+            .all(|i| i["endTime"].as_str().unwrap() <= "2026-11-16T07:30:00Z")
+    );
+    assert_eq!(its.last().unwrap()["startTime"], "2026-11-16T07:00:00Z");
+    assert_eq!(its.last().unwrap()["endTime"], "2026-11-16T07:25:00Z");
+    // arrive by 08:45: the slow bus leaves latest (08:05)
+    let (_, json) = call(&app, get(&plan("2026-11-16T07:45:00Z", 1))).await;
+    assert_eq!(
+        json["itineraries"][0]["startTime"], "2026-11-16T07:05:00Z",
+        "{json}"
+    );
+    assert_eq!(json["itineraries"][0]["endTime"], "2026-11-16T07:40:00Z");
+    // arrive by 07:00: only the night bus of the previous service day
+    let (_, json) = call(&app, get(&plan("2026-11-16T06:00:00Z", 1))).await;
+    assert_eq!(
+        json["itineraries"][0]["startTime"], "2026-11-16T00:10:00Z",
+        "{json}"
+    );
 }

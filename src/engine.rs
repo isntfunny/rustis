@@ -207,7 +207,7 @@ impl Snapshot {
     }
 
     pub fn plan(&self, q: &PlanRequest) -> Result<PlanResponse, Error> {
-        self.plan_with_modes(q, true, None, false)
+        self.plan_with_modes(q, true, None, false, false)
     }
 
     /// `route_type_ok`: only routes whose GTFS `route_type` passes are
@@ -218,6 +218,7 @@ impl Snapshot {
         allow_flex: bool,
         route_type_ok: Option<&dyn Fn(u16) -> bool>,
         dticket_only: bool,
+        arrive_by: bool,
     ) -> Result<PlanResponse, Error> {
         let dt = dticket_only.then(|| self.dticket());
         let mut route_mask = route_type_ok.map(|ok| {
@@ -280,9 +281,17 @@ impl Snapshot {
         // Exact, cheap pre-check: if no origin stop (or stop within a footpath)
         // has any service in the search period, or likewise no target stop,
         // there is no journey – answer without searching.
-        if let Some(side) =
-            self.no_service(&from.stops, &to.stops, rel as u32, q.max_travel_seconds, tz)
-        {
+        if let Some(side) = self.no_service(
+            &from.stops,
+            &to.stops,
+            if arrive_by {
+                (rel as u32).saturating_sub(q.max_travel_seconds)
+            } else {
+                rel as u32
+            },
+            q.max_travel_seconds,
+            tz,
+        ) {
             let mut warnings = self.warnings();
             warnings.push(format!(
                 "NO SERVICE: no trip serves any {side} stop (or a stop within walking distance) between {} and \
@@ -326,95 +335,175 @@ impl Snapshot {
                 })
                 .count()
         };
-        'outer: while rides(&found) < q.max_results && searches < 3 * q.max_results {
-            // Iterative deepening: the first window with a result decides;
-            // then one more search with slack collects Pareto alternatives
-            // (fewer transfers, later arrival).
-            let mut result = None;
-            // Once a window produced results, alternatives reuse it instead of
-            // growing from the smallest window again.
-            let windows: Vec<u32> = match ok_window {
-                Some(w) => vec![w],
-                None => match lb0 {
-                    Some(lb0) => windows(lb0, q.max_travel_seconds),
-                    None => break 'outer,
-                },
+        if arrive_by {
+            // `depart` is the deadline: the journeys arriving by it that leave
+            // latest. Single searches bounded by the deadline (window =
+            // deadline − departure): further back until one arrives in time,
+            // then from just after the latest departure found until no later
+            // one exists (earliest arrival is monotone in the departure).
+            let deadline = depart;
+            let mk = |d: u32| Query {
+                allow_flex,
+                allow_timed,
+                routes: route_mask.as_deref(),
+                positions: dt.map(|d| &d.positions),
+                sources: &from.stops,
+                targets: &to.stops,
+                depart: d,
+                max_transfers: q.max_transfers as usize,
+                window: deadline - d,
+                max_labels: self.max_labels,
             };
-            for w in windows {
-                let query = Query {
-                    allow_flex,
-                    allow_timed,
-                    routes: route_mask.as_deref(),
-                    positions: dt.map(|d| &d.positions),
-                    sources: &from.stops,
-                    targets: &to.stops,
-                    depart,
-                    max_transfers: q.max_transfers as usize,
-                    window: w,
-                    max_labels: self.max_labels,
-                };
-                searches += 1;
-                let (js, st) = raptor::search(&self.tt, &query, &mut lb);
+            let mut probe = |d: u32,
+                             found: &mut Vec<(Journey, u32)>,
+                             searches: &mut usize,
+                             stats: &mut Vec<_>,
+                             truncated: &mut bool|
+             -> Option<u32> {
+                *searches += 1;
+                let (js, st) = raptor::search(&self.tt, &mk(d), &mut lb);
                 stats.push(st);
-                truncated |= st.truncated;
-                if let Some(best) = js.iter().map(|j| j.arrival).min() {
-                    let dur = best - depart;
-                    let slack = (dur / 2).max(1800);
-                    let w2 = (dur + slack).min(q.max_travel_seconds).max(w);
-                    let (js2, st2) = if w2 > w {
-                        searches += 1;
-                        raptor::search(
-                            &self.tt,
-                            &Query {
-                                window: w2,
-                                ..query
-                            },
-                            &mut lb,
-                        )
-                    } else {
-                        (Vec::new(), Default::default())
+                *truncated |= st.truncated;
+                let mut latest = None;
+                for j in js {
+                    if j.arrival > deadline
+                        || !j
+                            .steps
+                            .iter()
+                            .any(|s| matches!(s, Step::Ride { .. } | Step::Flex { .. }))
+                    {
+                        continue;
+                    }
+                    let dep = self.journey_departure(&j, d);
+                    latest = latest.max(Some(dep));
+                    let sig = signature(&j);
+                    if !found.iter().any(|(f, _)| signature(f) == sig) {
+                        found.push((j, dep));
+                    }
+                }
+                latest
+            };
+            if let Some(lb0) = lb0 {
+                let max = q.max_travel_seconds.min(deadline);
+                let mut gap = lb0.clamp(60, max.max(60));
+                let mut latest = None;
+                while gap <= max {
+                    latest = probe(
+                        deadline - gap,
+                        &mut found,
+                        &mut searches,
+                        &mut stats,
+                        &mut truncated,
+                    );
+                    if latest.is_some() || gap == max {
+                        break;
+                    }
+                    gap = (gap + gap / 2).max(gap + 600).min(max);
+                }
+                while let Some(l) = latest {
+                    if l + 1 >= deadline || found.len() >= 4 * q.max_results + 8 {
+                        break;
+                    }
+                    match probe(l + 1, &mut found, &mut searches, &mut stats, &mut truncated) {
+                        Some(n) if n > l => latest = Some(n),
+                        _ => break,
+                    }
+                }
+            }
+        } else {
+            'outer: while rides(&found) < q.max_results && searches < 3 * q.max_results {
+                // Iterative deepening: the first window with a result decides;
+                // then one more search with slack collects Pareto alternatives
+                // (fewer transfers, later arrival).
+                let mut result = None;
+                // Once a window produced results, alternatives reuse it instead of
+                // growing from the smallest window again.
+                let windows: Vec<u32> = match ok_window {
+                    Some(w) => vec![w],
+                    None => match lb0 {
+                        Some(lb0) => windows(lb0, q.max_travel_seconds),
+                        None => break 'outer,
+                    },
+                };
+                for w in windows {
+                    let query = Query {
+                        allow_flex,
+                        allow_timed,
+                        routes: route_mask.as_deref(),
+                        positions: dt.map(|d| &d.positions),
+                        sources: &from.stops,
+                        targets: &to.stops,
+                        depart,
+                        max_transfers: q.max_transfers as usize,
+                        window: w,
+                        max_labels: self.max_labels,
                     };
-                    stats.push(st2);
-                    truncated |= st2.truncated;
-                    result = Some(if js2.is_empty() { js } else { js2 });
-                    ok_window = Some(w2.max(w));
+                    searches += 1;
+                    let (js, st) = raptor::search(&self.tt, &query, &mut lb);
+                    stats.push(st);
+                    truncated |= st.truncated;
+                    if let Some(best) = js.iter().map(|j| j.arrival).min() {
+                        let dur = best - depart;
+                        let slack = (dur / 2).max(1800);
+                        let w2 = (dur + slack).min(q.max_travel_seconds).max(w);
+                        let (js2, st2) = if w2 > w {
+                            searches += 1;
+                            raptor::search(
+                                &self.tt,
+                                &Query {
+                                    window: w2,
+                                    ..query
+                                },
+                                &mut lb,
+                            )
+                        } else {
+                            (Vec::new(), Default::default())
+                        };
+                        stats.push(st2);
+                        truncated |= st2.truncated;
+                        result = Some(if js2.is_empty() { js } else { js2 });
+                        ok_window = Some(w2.max(w));
+                        break;
+                    }
+                    if st.truncated {
+                        break; // a larger window would exceed the budget too
+                    }
+                }
+                let Some(js) = result else { break 'outer };
+                let mut next = u32::MAX;
+                let mut added = false;
+                for j in js {
+                    let dep = self.journey_departure(&j, depart);
+                    if first_dep
+                        .is_some_and(|f| dep > f.saturating_add(q.alternatives_within_seconds))
+                    {
+                        continue;
+                    }
+                    // A walk without any ride can leave at any time: it must not
+                    // pin the next search to `depart + 1` (1 s steps until the
+                    // search budget is spent).
+                    if j.steps
+                        .iter()
+                        .any(|s| matches!(s, Step::Ride { .. } | Step::Flex { .. }))
+                    {
+                        next = next.min(dep);
+                    }
+                    let sig = signature(&j);
+                    if !found.iter().any(|(f, _)| signature(f) == sig) {
+                        found.push((j, dep));
+                        added = true;
+                    }
+                }
+                if next == u32::MAX || (!added && next < depart) {
                     break;
                 }
-                if st.truncated {
-                    break; // a larger window would exceed the budget too
-                }
-            }
-            let Some(js) = result else { break 'outer };
-            let mut next = u32::MAX;
-            let mut added = false;
-            for j in js {
-                let dep = self.journey_departure(&j, depart);
-                if first_dep.is_some_and(|f| dep > f.saturating_add(q.alternatives_within_seconds))
+                first_dep.get_or_insert(next);
+                depart = next.max(depart) + 1;
+                if first_dep
+                    .is_some_and(|f| depart > f.saturating_add(q.alternatives_within_seconds))
                 {
-                    continue;
+                    break;
                 }
-                // A walk without any ride can leave at any time: it must not
-                // pin the next search to `depart + 1` (1 s steps until the
-                // search budget is spent).
-                if j.steps
-                    .iter()
-                    .any(|s| matches!(s, Step::Ride { .. } | Step::Flex { .. }))
-                {
-                    next = next.min(dep);
-                }
-                let sig = signature(&j);
-                if !found.iter().any(|(f, _)| signature(f) == sig) {
-                    found.push((j, dep));
-                    added = true;
-                }
-            }
-            if next == u32::MAX || (!added && next < depart) {
-                break;
-            }
-            first_dep.get_or_insert(next);
-            depart = next.max(depart) + 1;
-            if first_dep.is_some_and(|f| depart > f.saturating_add(q.alternatives_within_seconds)) {
-                break;
             }
         }
         let mut itineraries: Vec<Itinerary> = found
@@ -442,7 +531,11 @@ impl Snapshot {
                 kept.push(it);
             }
         }
-        kept.sort_by_key(|i| (i.arrival, i.transfers));
+        if arrive_by {
+            kept.sort_by_key(|i| (std::cmp::Reverse(i.departure), i.arrival, i.transfers));
+        } else {
+            kept.sort_by_key(|i| (i.arrival, i.transfers));
+        }
         kept.truncate(q.max_results);
         if std::env::var_os("RUSTIS_TIMING").is_some() {
             eprintln!("timing: {:?} searches={searches} {:?}", t0.elapsed(), stats);
