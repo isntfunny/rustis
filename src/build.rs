@@ -248,10 +248,11 @@ pub struct Builder {
     n_gtfs_trips: u32,
     /// Per GTFS trip: index into `headsigns` (deduplicated strings; 0 = none).
     gtfs_trip_headsign: ArrayWriter<u32>,
-    /// Per GTFS trip: `trip_short_name` and display name (indices into
-    /// `headsigns`, the shared string pool; 0 = none / the route's line).
-    gtfs_trip_short: ArrayWriter<u32>,
-    gtfs_trip_display: ArrayWriter<u32>,
+    /// Per GTFS trip: `trip_short_name` and display name (empty = none /
+    /// the route's line). Not deduplicated: train numbers are nearly unique,
+    /// an in-memory index over them would cost GBs during a Europe build.
+    gtfs_trip_short: StrWriter,
+    gtfs_trip_display: StrWriter,
     headsigns: StrWriter,
     headsign_idx: HashMap<String, u32>,
     route_stop_off: Vec<u64>,
@@ -359,8 +360,8 @@ impl Builder {
             gtfs_trip_id: StrWriter::create(dir, "gtfs_trip_id")?,
             n_gtfs_trips: 0,
             gtfs_trip_headsign: ArrayWriter::create(dir, "gtfs_trip_headsign")?,
-            gtfs_trip_short: ArrayWriter::create(dir, "gtfs_trip_short")?,
-            gtfs_trip_display: ArrayWriter::create(dir, "gtfs_trip_display")?,
+            gtfs_trip_short: StrWriter::create(dir, "gtfs_trip_short")?,
+            gtfs_trip_display: StrWriter::create(dir, "gtfs_trip_display")?,
             headsigns: {
                 let mut w = StrWriter::create(dir, "headsigns")?;
                 w.push("")?;
@@ -1504,13 +1505,11 @@ impl Builder {
             let i = self.intern(h)?;
             self.gtfs_trip_headsign.push(i)?;
         }
-        for h in d.gtfs_trip_short_names {
-            let i = self.intern(h)?;
-            self.gtfs_trip_short.push(i)?;
+        for h in &d.gtfs_trip_short_names {
+            self.gtfs_trip_short.push(h)?;
         }
-        for h in d.gtfs_trip_displays {
-            let i = self.intern(h)?;
-            self.gtfs_trip_display.push(i)?;
+        for h in &d.gtfs_trip_displays {
+            self.gtfs_trip_display.push(h)?;
         }
         self.n_gtfs_trips += d.gtfs_trip_ids.len() as u32;
         let mut routes = 0u64;
