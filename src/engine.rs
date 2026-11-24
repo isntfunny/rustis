@@ -9,9 +9,21 @@ use crate::tt::Timetable;
 use anyhow::{Context, Result};
 use std::path::Path;
 
-/// Search windows tried one after another (seconds after the departure);
-/// a later window is only searched if the earlier one found nothing.
-const WINDOWS: [u32; 5] = [2 * 3600, 4 * 3600, 8 * 3600, 16 * 3600, 36 * 3600];
+/// Search windows tried one after another (seconds after the departure); a
+/// later window is only searched if the earlier one found nothing. The first
+/// window is the lower bound of the trip plus slack for waits and changes,
+/// each next one 1.5 times as long: a tight first window keeps the pruning
+/// bound close to the real arrival on long trips.
+fn windows(lb: u32, max_travel: u32) -> Vec<u32> {
+    let mut w = lb.saturating_add((lb / 4).max(3600));
+    let mut out = Vec::new();
+    while w < max_travel {
+        out.push(w);
+        w = w.saturating_add(w / 2);
+    }
+    out.push(max_travel);
+    out
+}
 const MAX_ENDPOINT_WALK: u32 = 3 * 3600;
 const MAX_TRAVEL: u32 = 4 * 86_400;
 
@@ -24,7 +36,7 @@ pub struct Snapshot {
 /// Default per-search label budget; bounds the memory and time of searches
 /// that would otherwise explore most of the network (e.g. targets without
 /// service on the requested day).
-pub const DEFAULT_MAX_LABELS: usize = 150_000;
+pub const DEFAULT_MAX_LABELS: usize = usize::MAX;
 
 /// Builds a snapshot from several feeds into `dest` (staging dir + rename).
 pub fn build_snapshot(feeds: &[FeedSpec], dest: &Path, opts: BuildOptions) -> Result<SnapshotMeta> {
@@ -255,6 +267,15 @@ impl Snapshot {
         let mut first_dep: Option<u32> = None;
         // Lower bounds depend only on the targets: shared by all searches.
         let mut lb = raptor::LowerBound::new(&self.tt, &to.stops);
+        // Shortest conceivable trip; no target reachable at all → no search.
+        let lb0 = from
+            .stops
+            .iter()
+            .filter_map(|&(s, w)| {
+                lb.below(s, q.max_travel_seconds)
+                    .map(|d| d.saturating_add(w))
+            })
+            .min();
         let mut ok_window: Option<u32> = None;
         let mut truncated = false;
         let rides = |found: &[(Journey, u32)]| {
@@ -276,12 +297,10 @@ impl Snapshot {
             // growing from the smallest window again.
             let windows: Vec<u32> = match ok_window {
                 Some(w) => vec![w],
-                None => WINDOWS
-                    .iter()
-                    .copied()
-                    .filter(|&w| w < q.max_travel_seconds)
-                    .chain([q.max_travel_seconds])
-                    .collect(),
+                None => match lb0 {
+                    Some(lb0) => windows(lb0, q.max_travel_seconds),
+                    None => break 'outer,
+                },
             };
             for w in windows {
                 let query = Query {
@@ -1025,4 +1044,23 @@ pub fn import_gtfs_with(src: &Path, dest: &Path, opts: &BuildOptions) -> Result<
         anyhow::bail!("{e}");
     }
     Ok(m)
+}
+
+#[cfg(test)]
+mod window_tests {
+    use super::windows;
+
+    #[test]
+    fn first_window_covers_the_lower_bound_and_windows_grow_to_the_cap() {
+        // Ulm → Dresden: lower bound ≈ 4 h; the old fixed steps jumped from
+        // 4 h to 8 h, where the search ran out of budget.
+        let w = windows(4 * 3600, 86_400);
+        assert_eq!(w[0], 5 * 3600);
+        assert!(w.windows(2).all(|p| p[1] > p[0]));
+        assert_eq!(*w.last().unwrap(), 86_400);
+        // short trips still start with at least an hour of slack
+        assert_eq!(windows(600, 86_400)[0], 600 + 3600);
+        // lower bound beyond the cap: only the cap
+        assert_eq!(windows(90_000, 86_400), [86_400]);
+    }
 }

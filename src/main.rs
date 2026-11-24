@@ -185,7 +185,8 @@ enum Cmd {
         listen: std::net::SocketAddr,
         #[arg(long, default_value_t = 2)]
         max_concurrency: usize,
-        /// Per-search label budget (bounds per-query memory/time).
+        /// Optional per-search label cap (default: none). Only for operators who
+        /// must bound per-query memory/time; capped searches may miss journeys.
         #[arg(long, default_value_t = rustis::DEFAULT_MAX_LABELS)]
         max_labels: usize,
         /// Check every N seconds whether --snapshot (e.g. ROOT/current, a

@@ -191,6 +191,11 @@ impl<'t> LowerBound<'t> {
         }
         lb
     }
+    /// Exact lower bound of `s` to the targets if it is below `limit`.
+    pub fn below(&mut self, s: u32, limit: u32) -> Option<u32> {
+        self.at_least(s, limit);
+        self.settled.get(s).filter(|&d| d < limit)
+    }
     /// True if `lb(s) ≥ need` (expands the search only up to `need`).
     fn at_least(&mut self, s: u32, need: u32) -> bool {
         loop {
