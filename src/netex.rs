@@ -663,6 +663,7 @@ pub(super) fn read(p: &mut Parser<'_>, spec: &FeedSpec) -> Result<FeedData> {
     Ok(FeedData {
         flex: Vec::new(),
         stop_tz: vec![tz; stops.len()],
+        stop_platforms: vec![String::new(); stops.len()],
         report,
         stops,
         change: Vec::new(),

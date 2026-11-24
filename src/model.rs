@@ -123,6 +123,10 @@ pub struct Leg {
     pub arrival_time: String,
     pub duration_seconds: u32,
     pub trip_id: Option<String>,
+    /// `YYYYMMDD_HH:MM` (service date, first departure) – with `trip_id` the
+    /// MOTIS-style trip reference.
+    #[serde(skip)]
+    pub trip_ref: Option<String>,
     pub route_id: Option<String>,
     pub line: Option<String>,
     /// GTFS `trip_short_name` (after the feed script), e.g. `ICE 119`.

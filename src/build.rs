@@ -34,7 +34,10 @@ pub const FLAG_DROP_OFF_BOOKING: u8 = 8;
 /// Change time value meaning "no transfer possible at this stop" (type 3).
 pub const FORBIDDEN: u32 = u32::MAX;
 pub const NONE: u32 = u32::MAX;
-pub const SNAPSHOT_VERSION: u32 = 8;
+pub const SNAPSHOT_VERSION: u32 = 9;
+
+/// Explicit footpaths faster than this (plus 500 m) are treated as data errors.
+pub const MAX_TRANSFER_SPEED_M_PER_S: f64 = 5.0;
 /// Bit set in `foot_secs` for footpaths given explicitly by transfers.txt
 /// (the walk is not raised to the change time of the stop it starts at).
 pub const FOOT_EXPLICIT: u32 = 1 << 31;
@@ -172,6 +175,8 @@ struct FeedData {
     report: FeedReport,
     stops: Vec<Stop>,
     stop_tz: Vec<u16>,
+    /// GTFS `platform_code` per stop (empty = none).
+    stop_platforms: Vec<String>,
     change: Vec<(u32, u32)>,
     route_infos: Vec<RouteInfo>,
     gtfs_trip_ids: Vec<String>,
@@ -253,6 +258,7 @@ pub struct Builder {
     /// an in-memory index over them would cost GBs during a Europe build.
     gtfs_trip_short: StrWriter,
     gtfs_trip_display: StrWriter,
+    stop_platform: StrWriter,
     headsigns: StrWriter,
     headsign_idx: HashMap<String, u32>,
     route_stop_off: Vec<u64>,
@@ -362,6 +368,7 @@ impl Builder {
             gtfs_trip_headsign: ArrayWriter::create(dir, "gtfs_trip_headsign")?,
             gtfs_trip_short: StrWriter::create(dir, "gtfs_trip_short")?,
             gtfs_trip_display: StrWriter::create(dir, "gtfs_trip_display")?,
+            stop_platform: StrWriter::create(dir, "stop_platform")?,
             headsigns: {
                 let mut w = StrWriter::create(dir, "headsigns")?;
                 w.push("")?;
@@ -560,6 +567,7 @@ impl Parser<'_> {
         let stop_base = 0u32;
         let mut stops = Vec::new();
         let mut stop_tz = Vec::new();
+        let mut stop_platforms = Vec::new();
         let mut stop_idx: HashMap<Box<[u8]>, u32> = HashMap::new();
         let mut parents: Vec<(u32, Vec<u8>)> = Vec::new();
         feed.rows("stops.txt", |c, r| {
@@ -588,6 +596,7 @@ impl Parser<'_> {
             }
             let stz = text(r, c.get("stop_timezone"));
             stop_tz.push(stz);
+            stop_platforms.push(text(r, c.get("platform_code")));
             stops.push(Stop {
                 stop_id: ns(name, &String::from_utf8_lossy(id)),
                 name: text(r, c.get("stop_name")),
@@ -1393,6 +1402,7 @@ impl Parser<'_> {
             report,
             stops,
             stop_tz,
+            stop_platforms,
             change,
             route_infos,
             gtfs_trip_ids,
@@ -1465,6 +1475,9 @@ impl Builder {
         self.stop_feed
             .extend(std::iter::repeat_n(feed_no, d.stops.len()));
         self.stops.extend(d.stops);
+        for p in &d.stop_platforms {
+            self.stop_platform.push(p)?;
+        }
         self.stop_tz
             .extend(d.stop_tz.iter().map(|&t| tz_map[t as usize]));
         self.change
@@ -1775,6 +1788,25 @@ impl Builder {
             (a, b, secs)
         }));
         let mut explicit = std::mem::take(&mut self.footpaths);
+        // transfers.txt pairs that would need more than running speed are
+        // data errors (e.g. DELFI links a misplaced "Neuss Hauptbahnhof" near
+        // Stade to the real one in 5 min); they would teleport riders
+        let before = explicit.len();
+        explicit.retain(|&(a, b, secs)| {
+            let (sa, sb) = (&self.stops[a as usize], &self.stops[b as usize]);
+            match (sa.lat.zip(sa.lon), sb.lat.zip(sb.lon)) {
+                (Some(p), Some(q)) => {
+                    haversine(p, q) <= MAX_TRANSFER_SPEED_M_PER_S * f64::from(secs) + 500.0
+                }
+                _ => true,
+            }
+        });
+        let implausible = before - explicit.len();
+        if implausible > 0 {
+            eprintln!(
+                "dropped {implausible} transfers.txt footpath(s) longer than {MAX_TRANSFER_SPEED_M_PER_S} m/s × time + 500 m"
+            );
+        }
         if self.opts.motis_footpaths {
             generated.retain(|_| false);
             let metas = motis_metas(&self.stops, &walkable, &self.stop_feed, &station);
@@ -1929,6 +1961,7 @@ impl Builder {
         self.gtfs_trip_headsign.finish(m)?;
         self.gtfs_trip_short.finish(m)?;
         self.gtfs_trip_display.finish(m)?;
+        self.stop_platform.finish(m)?;
         self.headsigns.finish(m)?;
         let cat_bytes = catalog::write(&self.stops, &dir.join("catalog.bin"))?;
         let _ = cat_bytes;

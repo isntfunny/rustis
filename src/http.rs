@@ -126,6 +126,13 @@ pub fn router_with(handle: Arc<SnapshotHandle>, max_concurrency: usize) -> Route
         .route("/v1/plan", post(plan))
         .route("/api/v6/plan", get(motis_plan_get).post(motis_plan_post))
         .route("/api/v6/map/stops", get(motis_stops))
+        .route("/api/v1/map/stops", get(motis_stops))
+        .route("/api/v1/geocode", get(motis_geocode))
+        .route("/api/v6/stoptimes", get(motis_stoptimes))
+        .route("/api/v5/stoptimes", get(motis_stoptimes))
+        .route("/api/v6/trip", get(motis_trip))
+        .route("/api/v5/trip", get(motis_trip))
+        .route("/api/v1/trip-by-name", get(motis_trip_by_name))
         .layer(DefaultBodyLimit::max(64 * 1024))
         .with_state(state)
 }
@@ -308,3 +315,34 @@ async fn motis_stops(
         Err(r) => r,
     }
 }
+
+macro_rules! motis_get {
+    ($name:ident, $q:ty, $f:path) => {
+        async fn $name(State(s): State<AppState>, q: MotisQuery<$q>) -> Response {
+            let Query(q) = match q {
+                Ok(q) => q,
+                Err(e) => return error(StatusCode::BAD_REQUEST, e.body_text()),
+            };
+            match run_blocking(&s, move |snap| $f(snap, &q)).await {
+                Ok(v) => Json(v).into_response(),
+                Err(r) => r,
+            }
+        }
+    };
+}
+motis_get!(
+    motis_geocode,
+    crate::motis::GeocodeQuery,
+    crate::motis::geocode
+);
+motis_get!(
+    motis_stoptimes,
+    crate::motis::StopTimesQuery,
+    crate::motis::stoptimes
+);
+motis_get!(motis_trip, crate::motis::TripQuery, crate::motis::trip);
+motis_get!(
+    motis_trip_by_name,
+    crate::motis::TripByNameQuery,
+    crate::motis::trip_by_name
+);

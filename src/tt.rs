@@ -15,11 +15,14 @@ pub struct Strs {
 }
 
 impl Strs {
-    fn open(dir: &Path, name: &str, m: &crate::store::Manifest) -> Result<Self> {
+    pub(crate) fn open(dir: &Path, name: &str, m: &crate::store::Manifest) -> Result<Self> {
         Ok(Self {
             off: Array::open(dir, &format!("{name}.off"), m)?,
             bytes: Array::open(dir, &format!("{name}.bytes"), m)?,
         })
+    }
+    pub fn len(&self) -> usize {
+        self.off.len().saturating_sub(1)
     }
     pub fn get(&self, i: usize) -> &str {
         let (a, b) = (self.off[i] as usize, self.off[i + 1] as usize);
@@ -83,6 +86,10 @@ pub struct Timetable {
     pub gtfs_trip_short: Strs,
     pub gtfs_trip_display: Strs,
     pub headsigns: Strs,
+    /// GTFS `platform_code` per stop (empty = none).
+    pub stop_platform: Strs,
+    /// Station / trip lookup indexes.
+    pub ix: crate::search::Index,
     /// Unix seconds that relative time 0 corresponds to.
     pub origin: i64,
     /// `base[tz][day]`: relative time of "noon − 12 h" of service day `day`
@@ -188,6 +195,8 @@ impl Timetable {
             gtfs_trip_short: Strs::open(dir, "gtfs_trip_short", m)?,
             gtfs_trip_display: Strs::open(dir, "gtfs_trip_display", m)?,
             headsigns: Strs::open(dir, "headsigns", m)?,
+            stop_platform: Strs::open(dir, "stop_platform", m)?,
+            ix: crate::search::Index::open(dir, m)?,
             origin,
             base,
             tzs,

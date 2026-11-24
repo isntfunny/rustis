@@ -1,0 +1,3 @@
+route_id,agency_id,route_short_name,route_long_name,route_type
+ICE,db,ICE,,2
+RE,db,RE1,,2

@@ -1,4 +1,5 @@
 //! Rustis: GTFS feeds → immutable memory-mapped snapshot → RAPTOR with lower-bound pruning.
+mod board;
 pub mod build;
 mod catalog;
 mod dticket;
@@ -12,6 +13,7 @@ mod model;
 pub mod motis;
 mod raptor;
 mod script;
+mod search;
 pub mod store;
 mod tt;
 pub mod update;

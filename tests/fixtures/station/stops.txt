@@ -1,0 +1,8 @@
+stop_id,stop_name,stop_lat,stop_lon,location_type,parent_station,platform_code
+ULM,Ulm Hbf,48.3994,9.9829,1,,
+ULM1,Ulm Hbf,48.3995,9.9830,0,ULM,1
+ULM2,Ulm Hbf,48.3996,9.9831,0,ULM,2
+ULMX,Ulm Hauptbahnhof,48.3990,9.9825,0,,
+NU,Neu-Ulm,48.3930,10.0110,0,,
+FH,Freital-Hainsberg,50.9900,13.6400,0,,
+FAR,Far Away,53.55,10.00,0,,

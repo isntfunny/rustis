@@ -165,6 +165,11 @@ impl Catalog {
         self.bytes(Sec::CatIdOffsets, Sec::CatIdBytes, i)
     }
 
+    pub(crate) fn parent(&self, i: usize) -> Option<usize> {
+        let p = self.u32_at(Sec::CatParent, i);
+        (p != NO_PARENT).then_some(p as usize)
+    }
+
     pub(crate) fn name(&self, i: usize) -> String {
         self.text(Sec::CatNameOffsets, Sec::CatNameBytes, i)
     }

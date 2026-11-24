@@ -114,7 +114,8 @@ pub fn build_snapshot_jobs(
             }
         }
     });
-    let meta = b.finish(t0)?;
+    let mut meta = b.finish(t0)?;
+    crate::search::write(&staging, &mut meta.manifest, meta.n_stops)?;
     let json = serde_json::to_vec_pretty(&meta)?;
     std::fs::write(staging.join("snapshot.json"), json)?;
     for e in std::fs::read_dir(&staging)? {
@@ -142,6 +143,10 @@ impl Snapshot {
     }
 
     /// Deutschlandticket validity of every route (see `crate::dticket`).
+    pub(crate) fn tt(&self) -> &Timetable {
+        &self.tt
+    }
+
     pub fn dticket(&self) -> &crate::dticket::RouteFilter {
         self.dticket.get_or_init(|| crate::dticket::build(&self.tt))
     }
@@ -583,6 +588,7 @@ impl Snapshot {
             arrival_time: self.iso(arr, to.or(from)),
             duration_seconds: arr - dep,
             trip_id: None,
+            trip_ref: None,
             route_id: None,
             line: None,
             trip_short_name: None,
@@ -745,6 +751,7 @@ impl Snapshot {
                             .get(tt.trip_gtfs[trip as usize] as usize)
                             .to_owned(),
                     );
+                    leg.trip_ref = Some(self.trip_ref(&crate::board::TripRef { route, trip, day }));
                     leg.route_id = Some(tt.route_info_id.get(info).to_owned());
                     leg.line = Some(tt.route_info_line.get(info).to_owned());
                     leg.mode = Some(build::mode_name(tt.route_info_type[info]).to_owned());

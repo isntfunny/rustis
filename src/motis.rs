@@ -244,14 +244,27 @@ fn endpoints(
             })
             .collect()
     } else if !place.is_empty() {
+        // a stop stands for its whole station (platforms, duplicate feeds),
+        // like MOTIS' station equivalence
         let id = ids.rustis_id(place);
-        if snap.stop_timezone(&id).is_none() {
+        let Some(st) = snap.station(&id) else {
             return Err(Error::invalid(format!("{side}Place: unknown stop {place}")));
-        }
-        vec![Endpoint {
-            stop_id: id,
-            walk_seconds: 0,
-        }]
+        };
+        let tt = snap.tt();
+        let mut v: Vec<Endpoint> =
+            std::iter::once(id.clone())
+                .chain(st.stops.iter().map(|&s| {
+                    String::from_utf8_lossy(tt.catalog.id_bytes(s as usize)).into_owned()
+                }))
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|stop_id| Endpoint {
+                    stop_id,
+                    walk_seconds: 0,
+                })
+                .collect();
+        v.dedup_by(|a, b| a.stop_id == b.stop_id);
+        v
     } else {
         return Err(Error::invalid(format!("{side}Place is required")));
     };
@@ -358,7 +371,10 @@ fn leg_json(ids: &Ids, l: &Leg, start: Option<[f64; 2]>, end: Option<[f64; 2]>) 
             v["deutschlandticket"] = json!(d);
         }
         v["routeType"] = json!(l.route_type);
-        v["tripId"] = json!(l.trip_id.as_deref().map(|t| ids.motis_id(t)));
+        v["tripId"] = json!(l.trip_id.as_deref().map(|t| match &l.trip_ref {
+            Some(r) => format!("{r}_{}", ids.motis_id(t)),
+            None => ids.motis_id(t),
+        }));
         v["routeId"] = json!(l.route_id.as_deref().map(|t| ids.motis_id(t)));
         if let Some(a) = &l.agency {
             v["agencyName"] = json!(a);
@@ -559,6 +575,352 @@ pub fn stops(snap: &Snapshot, q: &StopsQuery) -> Result<Value, Error> {
             .map(|s| place_json(&ids, Some(s), "", None, None, None))
             .collect(),
     ))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GeocodeQuery {
+    pub text: String,
+    /// Number of matches (default 10, at most 50).
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StopTimesQuery {
+    pub stop_id: String,
+    pub time: Option<String>,
+    /// Number of events (default 10, at most 200).
+    pub n: Option<usize>,
+    /// `true`: arrivals instead of departures.
+    pub arrive_by: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TripQuery {
+    pub trip_id: String,
+    /// Service date for a bare GTFS trip id (default: today).
+    pub date: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TripByNameQuery {
+    pub name: String,
+    /// Service date `YYYY-MM-DD` (default: today, Europe/Berlin).
+    pub date: Option<String>,
+    /// Only trips calling at this stop/station.
+    pub stop_id: Option<String>,
+    /// At most this many trips (default 10, at most 50).
+    pub limit: Option<usize>,
+}
+
+fn ts(snap: &Snapshot, rel: u32) -> String {
+    jiff::Timestamp::from_second(snap.unix(rel))
+        .map(|t| t.strftime("%Y-%m-%dT%H:%M:%SZ").to_string())
+        .unwrap_or_default()
+}
+
+fn query_time(snap: &Snapshot, time: Option<&str>) -> Result<u32, Error> {
+    let t = match time {
+        Some(t) => t
+            .parse::<jiff::Timestamp>()
+            .map_err(|e| Error::invalid(format!("time: {e}")))?,
+        None => jiff::Timestamp::now(),
+    };
+    snap.rel(t.as_second())
+        .ok_or_else(|| Error::invalid("time is outside the snapshot horizon"))
+}
+
+fn service_date(date: Option<&str>) -> Result<jiff::civil::Date, Error> {
+    match date {
+        Some(d) => jiff::civil::Date::strptime("%Y-%m-%d", d)
+            .map_err(|_| Error::invalid("date must be YYYY-MM-DD")),
+        None => Ok(jiff::Timestamp::now()
+            .to_zoned(jiff::tz::TimeZone::get("Europe/Berlin").unwrap_or(jiff::tz::TimeZone::UTC))
+            .date()),
+    }
+}
+
+/// A stop as MOTIS place, with times (relative seconds) and track.
+fn stop_place(snap: &Snapshot, ids: &Ids, s: u32, arr: Option<u32>, dep: Option<u32>) -> Value {
+    let tt = snap.tt();
+    let stop = tt.catalog.stop(s as usize, tt.served(s as usize));
+    let (a, d) = (arr.map(|t| ts(snap, t)), dep.map(|t| ts(snap, t)));
+    let mut v = place_json(ids, Some(&stop), "", None, a.as_deref(), d.as_deref());
+    let track = tt.stop_platform.get(s as usize);
+    if !track.is_empty() {
+        v["track"] = json!(track);
+        v["scheduledTrack"] = json!(track);
+    }
+    v
+}
+
+fn station_place(snap: &Snapshot, ids: &Ids, st: &crate::board::Station) -> Value {
+    let tt = snap.tt();
+    let mut v = stop_place(snap, ids, st.rep, None, None);
+    if v["lat"] == json!(0.0)
+        && v["lon"] == json!(0.0)
+        && let Some(c) = st.stops.iter().find_map(|&s| tt.catalog.coord(s as usize))
+    {
+        v["lat"] = json!(c[0]);
+        v["lon"] = json!(c[1]);
+    }
+    v
+}
+
+/// Trip attributes shared by board entries, trips and name matches.
+fn trip_fields(snap: &Snapshot, ids: &Ids, at: &crate::board::TripRef, v: &mut Value) {
+    let tt = snap.tt();
+    let r = at.route as usize;
+    let info = tt.route_info[r] as usize;
+    let g = at.gtfs(tt);
+    let line = tt.route_info_line.get(info);
+    let display = tt.gtfs_trip_display.get(g);
+    let short = tt.gtfs_trip_short.get(g);
+    let h = tt.gtfs_trip_headsign[g] as usize;
+    let last = tt.n_route_stops(r) - 1;
+    let headsign = if h != 0 {
+        tt.headsigns.get(h).to_owned()
+    } else {
+        tt.catalog.name(tt.route_stop(r, last) as usize)
+    };
+    v["mode"] = json!(mode(tt.route_info_type[info]));
+    v["realTime"] = json!(false);
+    v["headsign"] = json!(headsign);
+    v["routeShortName"] = json!(line);
+    v["displayName"] = json!(if display.is_empty() { line } else { display });
+    if !short.is_empty() {
+        v["tripShortName"] = json!(short);
+    }
+    v["routeType"] = json!(tt.route_info_type[info]);
+    v["routeId"] = json!(ids.motis_id(tt.route_info_id.get(info)));
+    v["tripId"] = json!(format!(
+        "{}_{}",
+        snap.trip_ref(at),
+        ids.motis_id(tt.gtfs_trip_id.get(g))
+    ));
+    let agency = tt.route_info_agency.get(info);
+    if !agency.is_empty() {
+        v["agencyName"] = json!(agency);
+    }
+    let color = tt.route_info_color.get(info);
+    if !color.is_empty() {
+        v["routeColor"] = json!(color);
+    }
+    v["cancelled"] = json!(false);
+    v["tripCancelled"] = json!(false);
+    v["source"] = json!("");
+}
+
+/// `GET /api/v1/geocode?text=…`: stations only (one per station).
+pub fn geocode(snap: &Snapshot, q: &GeocodeQuery) -> Result<Value, Error> {
+    let ids = Ids::new(snap);
+    let limit = q.limit.unwrap_or(10).clamp(1, 50);
+    Ok(Value::Array(
+        snap.geocode(&q.text, limit)
+            .iter()
+            .map(|(st, score)| {
+                let p = station_place(snap, &ids, st);
+                let areas: Vec<Value> = st
+                    .area
+                    .iter()
+                    .map(|a| json!({"name": a, "adminLevel": 8, "matched": false, "default": true}))
+                    .collect();
+                json!({
+                    "type": "STOP",
+                    "id": p["stopId"],
+                    "name": p["name"],
+                    "lat": p["lat"],
+                    "lon": p["lon"],
+                    "level": 0.0,
+                    "score": score,
+                    "tokens": [],
+                    "areas": areas,
+                })
+            })
+            .collect(),
+    ))
+}
+
+fn resolve_station(snap: &Snapshot, ids: &Ids, id: &str) -> Result<crate::board::Station, Error> {
+    snap.station(&ids.rustis_id(id))
+        .ok_or_else(|| Error::invalid(format!("unknown stop {id}")))
+}
+
+/// `GET /api/v6/stoptimes?stopId=…&time=…&n=…[&arriveBy=true]`: departures
+/// (arrivals) of the whole station the stop belongs to; schedule only.
+pub fn stoptimes(snap: &Snapshot, q: &StopTimesQuery) -> Result<Value, Error> {
+    let ids = Ids::new(snap);
+    let st = resolve_station(snap, &ids, &q.stop_id)?;
+    let t = query_time(snap, q.time.as_deref())?;
+    let n = q.n.unwrap_or(10).clamp(1, 200);
+    let arrivals = q.arrive_by == Some(true);
+    let tt = snap.tt();
+    // the same ride from duplicate feeds is shown once
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for e in snap.board(&st.stops, t, 2 * n, arrivals) {
+        let (a, d) = e.at.times(tt, e.pos as usize);
+        let last = tt.n_route_stops(e.at.route as usize) - 1;
+        let mut v = json!({});
+        trip_fields(snap, &ids, &e.at, &mut v);
+        if !seen.insert((
+            e.time,
+            v["displayName"].to_string(),
+            v["headsign"].to_string(),
+        )) {
+            continue;
+        }
+        let first = e.pos == 0;
+        let is_last = e.pos as usize == last;
+        v["place"] = stop_place(
+            snap,
+            &ids,
+            e.stop,
+            (!first).then_some(a),
+            (!is_last).then_some(d),
+        );
+        v["pickupDropoffType"] = json!("NORMAL");
+        let (end_arr, _) = e.at.times(tt, last);
+        v["tripTo"] = stop_place(
+            snap,
+            &ids,
+            tt.route_stop(e.at.route as usize, last),
+            Some(end_arr),
+            None,
+        );
+        let dt = snap.dticket();
+        v["deutschlandticket"] = json!(if arrivals {
+            dt.allows_ride(e.at.route, e.pos as usize - 1, e.pos as usize)
+        } else {
+            dt.allows_ride(e.at.route, e.pos as usize, e.pos as usize + 1)
+        });
+        out.push(v);
+        if out.len() == n {
+            break;
+        }
+    }
+    Ok(json!({
+        "place": station_place(snap, &ids, &st),
+        "stopTimes": out,
+        "previousPageCursor": "",
+        "nextPageCursor": "",
+    }))
+}
+
+/// Splits `YYYYMMDD_HH:MM_<id>` (MOTIS trip id); a bare id has no date/time.
+fn parse_trip_id(id: &str) -> (Option<jiff::civil::Date>, Option<u32>, &str) {
+    let mut it = id.splitn(3, '_');
+    if let (Some(d), Some(hm), Some(rest)) = (it.next(), it.next(), it.next())
+        && d.len() == 8
+        && let Ok(date) = jiff::civil::Date::strptime("%Y%m%d", d)
+        && let Some((h, m)) = hm.split_once(':')
+        && let (Ok(h), Ok(m)) = (h.parse::<u32>(), m.parse::<u32>())
+    {
+        return (Some(date), Some(h * 60 + m), rest);
+    }
+    (None, None, id)
+}
+
+/// `GET /api/v6/trip?tripId=…`: the whole trip as a one-leg itinerary.
+pub fn trip(snap: &Snapshot, q: &TripQuery) -> Result<Value, Error> {
+    let ids = Ids::new(snap);
+    let (date, hhmm, gtfs) = parse_trip_id(&q.trip_id);
+    let date = match date {
+        Some(d) => d,
+        None => service_date(q.date.as_deref())?,
+    };
+    let at = snap
+        .find_trip(&ids.rustis_id(gtfs), date, hhmm)
+        .ok_or_else(|| Error::invalid(format!("unknown trip {} on {date}", q.trip_id)))?;
+    let tt = snap.tt();
+    let r = at.route as usize;
+    let last = tt.n_route_stops(r) - 1;
+    let (_, dep) = at.times(tt, 0);
+    let (arr, _) = at.times(tt, last);
+    let stops: Vec<Value> = (0..=last)
+        .map(|p| {
+            let (a, d) = at.times(tt, p);
+            stop_place(
+                snap,
+                &ids,
+                tt.route_stop(r, p),
+                (p > 0).then_some(a),
+                (p < last).then_some(d),
+            )
+        })
+        .collect();
+    let geometry: Vec<[f64; 2]> = (0..=last)
+        .filter_map(|p| tt.catalog.coord(tt.route_stop(r, p) as usize))
+        .collect();
+    let mut leg = json!({
+        "from": stops[0],
+        "to": stops[last],
+        "duration": arr - dep,
+        "startTime": ts(snap, dep),
+        "endTime": ts(snap, arr),
+        "scheduledStartTime": ts(snap, dep),
+        "scheduledEndTime": ts(snap, arr),
+        "scheduled": true,
+        "interlineWithPreviousLeg": false,
+        "intermediateStops": stops[1..last],
+        "legGeometry": {
+            "points": polyline(&geometry, 6),
+            "precision": 6,
+            "length": geometry.len(),
+        },
+        "deutschlandticket": snap.dticket().allows_ride(at.route, 0, last),
+    });
+    trip_fields(snap, &ids, &at, &mut leg);
+    Ok(json!({
+        "duration": arr - dep,
+        "startTime": ts(snap, dep),
+        "endTime": ts(snap, arr),
+        "transfers": 0,
+        "legs": [leg],
+    }))
+}
+
+/// `GET /api/v1/trip-by-name?name=ICE%20930&date=…[&stopId=…]` (Rustis
+/// extension): trips of the service date by train name or number.
+pub fn trip_by_name(snap: &Snapshot, q: &TripByNameQuery) -> Result<Value, Error> {
+    let ids = Ids::new(snap);
+    if crate::search::name_key(&q.name).is_empty() {
+        return Err(Error::invalid("name must contain letters or digits"));
+    }
+    let date = service_date(q.date.as_deref())?;
+    let station = match &q.stop_id {
+        Some(id) => Some(resolve_station(snap, &ids, id)?),
+        None => None,
+    };
+    let limit = q.limit.unwrap_or(10).clamp(1, 50);
+    let tt = snap.tt();
+    let trips = snap.trips_by_name(
+        &q.name,
+        date,
+        station.as_ref().map(|s| s.stops.as_slice()),
+        limit,
+    );
+    Ok(json!({
+        "trips": trips.iter().map(|(at, pos)| {
+            let r = at.route as usize;
+            let last = tt.n_route_stops(r) - 1;
+            let mut v = json!({
+                "serviceDate": date.to_string(),
+                "from": stop_place(snap, &ids, tt.route_stop(r, 0), None, Some(at.times(tt, 0).1)),
+                "to": stop_place(snap, &ids, tt.route_stop(r, last), Some(at.times(tt, last).0), None),
+            });
+            if let Some(p) = pos {
+                let p = *p as usize;
+                let (a, d) = at.times(tt, p);
+                v["stop"] = stop_place(snap, &ids, tt.route_stop(r, p), (p > 0).then_some(a), (p < last).then_some(d));
+            }
+            trip_fields(snap, &ids, at, &mut v);
+            v
+        }).collect::<Vec<_>>(),
+    }))
 }
 
 #[cfg(test)]

@@ -16,7 +16,8 @@ replacement for [MOTIS](https://github.com/motis-project/motis) where RAM is sca
 
 > Status: early. The MOTIS-compatible subset (`/api/v6/plan` GET/POST incl. offsets,
 > `radius`, `transitModes`, and `/api/v6/map/stops`) is contract-tested against MOTIS
-> 2.11; other MOTIS endpoints are not provided.
+> 2.11. Also provided: `/api/v1/geocode` (stations only), `/api/v6/stoptimes` and
+> `/api/v6/trip` (schedule only, see below); other MOTIS endpoints are not.
 
 ## Commands
 
@@ -90,6 +91,29 @@ POST /v1/plan
   e.g. feeds not imported, Flex, unexploited transfer rules, search limit reached).
 * Per-request bounds: ≤ 64 origin/destination stops, `max_transfers` ≤ 8,
   `max_results` ≤ 10, `max_travel_seconds` ≤ 4 days; `503` when all query slots are busy.
+
+### Stations, departure boards and trips (MOTIS-compatible, schedule only)
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| GET | `/api/v1/geocode?text=ulm%20hbf&limit=10` | station autocomplete: one entry per station, `[{type:"STOP", id, name, lat, lon, score, areas:[{name}]}]` |
+| GET | `/api/v6/stoptimes?stopId=…&time=…&n=10[&arriveBy=true]` | departures (arrivals) of the station the stop belongs to: `displayName`, `tripShortName`, `headsign`, `place.departure`/`arrival`, `place.track`, `tripTo`, `tripId`, `deutschlandticket` |
+| GET | `/api/v6/trip?tripId=…` | a whole trip as a one-leg itinerary with every stop and its times |
+| GET | `/api/v1/trip-by-name?name=ICE%20930&date=YYYY-MM-DD[&stopId=…]` | Rustis extension: trips of a service date by train name (`ICE 930`, `RE1 4711`) or number (`930`), optionally calling at a station (`stop` = that call) |
+
+* **Stations**: served stops of one `parent_station` and stops with the same normalised name
+  within 500 m (platforms, duplicate feeds) form one station. Its id is a normal stop id
+  (preferably the parent station), stable across rebuilds, and usable as `fromPlace`/`toPlace`
+  (= all stops of the station, like MOTIS' station equivalence) and as `stopId`.
+* **Search** ignores case, diacritics (`Muenchen`, `München`), punctuation and abbreviations
+  (`Hauptbahnhof`/`Hbf`, `Bahnhof`/`Bf`/`Bhf`, `Straße`/`Str`); every word may be a prefix, in
+  any order. German stops get their town from the DHID municipality code (`de:08111` →
+  Stuttgart: VVS names its main station only `Hauptbahnhof`), shown in `areas`. Ranking: exact
+  name, name start, phrase match, then service volume (trains count tenfold).
+* **Trip ids** are `YYYYMMDD_HH:MM_<dataset>_<GTFS trip id>` (service date, scheduled departure
+  at the first stop) – also in `/api/v6/plan` legs; `/api/v6/trip` also accepts a bare GTFS trip
+  id with `&date=`.
+* No real-time data: `realTime` is always `false`; `track` is the GTFS `platform_code`.
 
 ## Container
 
