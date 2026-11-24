@@ -742,33 +742,30 @@ fn write_stations(dir: &Path, m: &mut Manifest, n: usize) -> Result<()> {
         let w: Vec<u64> = mem.iter().map(|&s| weight(s as usize)).collect();
         let total: u64 = w.iter().sum();
         // representative: a stop with a DHID (`de:08421:1008`, the national
-        // feed rather than a foreign copy), then the parent station carrying
-        // most service, else the busiest stop; ties by id (stable across
-        // rebuilds)
+        // feed rather than a foreign copy), then a parent station, then the
+        // most service (a parent's is that of its stops); ties by id (stable
+        // across rebuilds)
         let dhid = |s: u32| area_code(cat.id_bytes(s as usize)).is_some();
-        let pick = |cands: &mut dyn Iterator<Item = (u32, u64)>| {
-            cands
-                .max_by(|a, b| {
-                    dhid(a.0)
-                        .cmp(&dhid(b.0))
-                        .then(a.1.cmp(&b.1))
-                        .then_with(|| cat.id_bytes(b.0 as usize).cmp(cat.id_bytes(a.0 as usize)))
-                })
-                .map(|x| x.0)
+        let pw = |p: u32| -> u64 {
+            mem.iter()
+                .zip(&w)
+                .filter(|(s, _)| parent(**s as usize) == Some(p as usize))
+                .map(|(_, w)| *w)
+                .sum()
         };
-        let rep = if parents[g].is_empty() {
-            pick(&mut mem.iter().copied().zip(w.iter().copied()))
-        } else {
-            let pw = |p: u32| -> u64 {
-                mem.iter()
-                    .zip(&w)
-                    .filter(|(s, _)| parent(**s as usize) == Some(p as usize))
-                    .map(|(_, w)| *w)
-                    .sum()
-            };
-            pick(&mut parents[g].iter().map(|&p| (p, pw(p))))
-        }
-        .unwrap_or(mem[0]);
+        let rep = parents[g]
+            .iter()
+            .map(|&p| (p, true, pw(p)))
+            .chain(mem.iter().zip(&w).map(|(&s, &w)| (s, false, w)))
+            .max_by(|a, b| {
+                dhid(a.0)
+                    .cmp(&dhid(b.0))
+                    .then(a.1.cmp(&b.1))
+                    .then(a.2.cmp(&b.2))
+                    .then_with(|| cat.id_bytes(b.0 as usize).cmp(cat.id_bytes(a.0 as usize)))
+            })
+            .map(|x| x.0)
+            .unwrap_or(mem[0]);
         group_rep.push(rep);
         group_weight.push(total.min(u64::from(u32::MAX)) as u32);
         group_modes.push(mem.iter().fold(0, |a, &s| a | modes(s as usize)));
