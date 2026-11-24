@@ -31,6 +31,8 @@ pub struct Snapshot {
     tt: Timetable,
     /// Per-search label budget (see `raptor::Query::max_labels`).
     max_labels: usize,
+    /// Deutschlandticket validity per route (built on first use).
+    dticket: std::sync::OnceLock<crate::dticket::RouteFilter>,
 }
 
 /// Default per-search label budget; bounds the memory and time of searches
@@ -135,7 +137,13 @@ impl Snapshot {
         Ok(Self {
             tt: Timetable::open(dir)?,
             max_labels: DEFAULT_MAX_LABELS,
+            dticket: std::sync::OnceLock::new(),
         })
+    }
+
+    /// Deutschlandticket validity of every route (see `crate::dticket`).
+    pub fn dticket(&self) -> &crate::dticket::RouteFilter {
+        self.dticket.get_or_init(|| crate::dticket::build(&self.tt))
     }
 
     pub fn verify(&self) -> Result<()> {
@@ -194,15 +202,40 @@ impl Snapshot {
     }
 
     pub fn plan(&self, q: &PlanRequest) -> Result<PlanResponse, Error> {
-        self.plan_with_modes(q, true, true)
+        self.plan_with_modes(q, true, None, false)
     }
 
+    /// `route_type_ok`: only routes whose GTFS `route_type` passes are
+    /// boarded (applied in the search, not to finished journeys).
     pub(crate) fn plan_with_modes(
         &self,
         q: &PlanRequest,
         allow_flex: bool,
-        allow_timed: bool,
+        route_type_ok: Option<&dyn Fn(u16) -> bool>,
+        dticket_only: bool,
     ) -> Result<PlanResponse, Error> {
+        let dt = dticket_only.then(|| self.dticket());
+        let mut route_mask = route_type_ok.map(|ok| {
+            let mut by_type: std::collections::HashMap<u16, bool> = Default::default();
+            let n = self.tt.route_info.len();
+            let mut mask = vec![0u64; n.div_ceil(64)];
+            for r in 0..n {
+                let t = self.tt.route_info_type[self.tt.route_info[r] as usize];
+                if *by_type.entry(t).or_insert_with(|| ok(t)) {
+                    mask[r / 64] |= 1 << (r % 64);
+                }
+            }
+            mask
+        });
+        if let Some(dt) = dt {
+            route_mask = Some(match route_mask {
+                Some(m) => m.iter().zip(&dt.mask).map(|(a, b)| a & b).collect(),
+                None => dt.mask.clone(),
+            });
+        }
+        let allow_timed = route_mask
+            .as_ref()
+            .is_none_or(|m| m.iter().any(|&w| w != 0));
         if q.max_transfers > MAX_TRANSFERS {
             return Err(Error::invalid(format!(
                 "max_transfers must be ≤ {MAX_TRANSFERS}"
@@ -306,6 +339,8 @@ impl Snapshot {
                 let query = Query {
                     allow_flex,
                     allow_timed,
+                    routes: route_mask.as_deref(),
+                    positions: dt.map(|d| &d.positions),
                     sources: &from.stops,
                     targets: &to.stops,
                     depart,
@@ -552,6 +587,7 @@ impl Snapshot {
             line: None,
             trip_short_name: None,
             display_name: None,
+            deutschlandticket: None,
             mode: None,
             route_type: None,
             headsign: None,
@@ -717,6 +753,11 @@ impl Snapshot {
                     let gtfs = tt.trip_gtfs[trip as usize] as usize;
                     let nonempty = |v: &str| (!v.is_empty()).then(|| v.to_owned());
                     leg.trip_short_name = nonempty(tt.gtfs_trip_short.get(gtfs));
+                    leg.deutschlandticket = Some(self.dticket().allows_ride(
+                        route,
+                        board_pos as usize,
+                        alight_pos as usize,
+                    ));
                     leg.display_name =
                         nonempty(tt.gtfs_trip_display.get(gtfs)).or(leg.line.clone());
                     let h = tt.gtfs_trip_headsign[gtfs] as usize;

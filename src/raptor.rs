@@ -98,6 +98,11 @@ pub struct WalkLabel {
 pub struct Query<'a> {
     pub allow_flex: bool,
     pub allow_timed: bool,
+    /// Bitset over routes that may be boarded (`None`: all).
+    pub routes: Option<&'a [u64]>,
+    /// Partly usable routes: usable stop positions; a ride may only board,
+    /// pass and alight at usable positions.
+    pub positions: Option<&'a std::collections::HashMap<u32, Vec<bool>>>,
     pub sources: &'a [(u32, u32)],
     pub targets: &'a [(u32, u32)],
     /// Earliest departure from the rider's position (relative seconds).
@@ -406,6 +411,13 @@ impl Search<'_, '_, '_> {
             let mut routes: Vec<(u32, u32)> = queue.into_iter().collect();
             routes.sort_unstable();
             for (r, p0) in routes {
+                if self
+                    .q
+                    .routes
+                    .is_some_and(|m| m[r as usize / 64] >> (r % 64) & 1 == 0)
+                {
+                    continue;
+                }
                 if self.inserted > self.q.max_labels {
                     self.stats.truncated = true;
                     break;
@@ -573,7 +585,12 @@ impl Search<'_, '_, '_> {
         let tz = tt.route_tz[ru] as usize;
         // current trip: (local trip index, day, base, board pos, board_from)
         let mut cur: Option<(usize, u32, u32, u32, From)> = None;
+        let usable = self.q.positions.and_then(|m| m.get(&r));
         for pos in p0 as usize..n {
+            if usable.is_some_and(|u| !u[pos]) {
+                cur = None;
+                continue;
+            }
             let s = tt.route_stop(ru, pos);
             let flags = tt.route_flag(ru, pos);
             if let Some((j, day, base, bpos, from)) = cur

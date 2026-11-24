@@ -51,6 +51,13 @@ e.g. Transitous' scripts set train numbers such as `ICE 119`, route types and co
 Scripts are not bundled; put them next to the config (`scripts/*.lua`). A script that
 fails to load is reported and the feed is imported without it.
 
+Deutschlandticket (Rustis extension of `/api/v6/plan`): `deutschlandticket=true` only uses
+rides valid with the Deutschlandticket (local transport of German feeds; DB Fernverkehr only
+within the released sections Rostock–Stralsund, Gäubahn, Bremen–Norddeich, Dresden–Chemnitz;
+released cross-border stations; rules and sources in `src/dticket.rs`). Every transit leg and
+itinerary carries `deutschlandticket: true|false`. `transitModes` is applied in the search
+(as in MOTIS), not to finished journeys.
+
 ## HTTP API (loopback by default)
 
 | Method | Path | Purpose |

@@ -133,6 +133,9 @@ pub struct Leg {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
     pub mode: Option<String>,
+    /// Ride valid with the Deutschlandticket (transit legs; see `dticket`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deutschlandticket: Option<bool>,
     /// GTFS `route_type` (extended types kept).
     pub route_type: Option<u16>,
     /// `trip_headsign`, else the name of the trip's last stop.

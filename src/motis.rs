@@ -37,6 +37,8 @@ pub struct PlanQuery {
     pub radius: Option<f64>,
     /// Comma-separated MOTIS modes.
     pub transit_modes: Option<String>,
+    /// Rustis extension: only rides valid with the Deutschlandticket.
+    pub deutschlandticket: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -352,6 +354,9 @@ fn leg_json(ids: &Ids, l: &Leg, start: Option<[f64; 2]>, end: Option<[f64; 2]>) 
         if let Some(t) = &l.trip_short_name {
             v["tripShortName"] = json!(t);
         }
+        if let Some(d) = l.deutschlandticket {
+            v["deutschlandticket"] = json!(d);
+        }
         v["routeType"] = json!(l.route_type);
         v["tripId"] = json!(l.trip_id.as_deref().map(|t| ids.motis_id(t)));
         v["routeId"] = json!(l.route_id.as_deref().map(|t| ids.motis_id(t)));
@@ -382,6 +387,9 @@ fn itinerary_json(
         "startTime": utc(&it.departure_time),
         "endTime": utc(&it.arrival_time),
         "transfers": it.transfers,
+        // Rustis extension: every ride is valid with the Deutschlandticket
+        "deutschlandticket": it.legs.iter().filter(|l| l.kind == LegKind::Transit)
+            .all(|l| l.deutschlandticket == Some(true)),
         "legs": merge_walks(&it.legs).iter().map(|l| leg_json(ids, l, start, end)).collect::<Vec<_>>(),
     })
 }
@@ -485,17 +493,22 @@ pub fn plan(snap: &Snapshot, q: &PlanQuery, body: &PlanBody) -> Result<Value, Er
             .max_transfers
             .unwrap_or(DEFAULT_MAX_TRANSFERS)
             .min(MAX_TRANSFERS),
-        max_results: if modes.is_some() { MAX_RESULTS } else { wanted },
+        max_results: wanted,
         max_travel_seconds: MAX_TRAVEL_SECS,
         alternatives_within_seconds: SEARCH_WINDOW_SECS,
     };
     let allow_flex = modes
         .as_ref()
         .is_some_and(|m| m.iter().any(|x| x == "FLEX" || x == "ODM"));
-    let allow_timed = modes
-        .as_ref()
-        .is_none_or(|m| m.iter().any(|x| x != "FLEX" && x != "ODM"));
-    let resp = snap.plan_with_modes(&req, allow_flex, allow_timed)?;
+    // MOTIS applies transitModes in the search: a journey restricted to
+    // regional trains is found even if a faster ICE journey exists
+    let type_ok = |t: u16| modes.as_ref().is_none_or(|m| allowed(m, mode(t)));
+    let resp = snap.plan_with_modes(
+        &req,
+        allow_flex,
+        modes.is_some().then_some(&type_ok as &dyn Fn(u16) -> bool),
+        q.deutschlandticket.unwrap_or(false),
+    )?;
     let mut sorted: Vec<&Itinerary> = resp.itineraries.iter().collect();
     // MOTIS lists the journeys of the window by departure
     sorted.sort_by_key(|it| (it.departure, it.arrival));

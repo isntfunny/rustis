@@ -161,6 +161,14 @@ impl Catalog {
         String::from_utf8_lossy(self.bytes(offs, bytes, i)).into_owned()
     }
 
+    pub(crate) fn id_bytes(&self, i: usize) -> &[u8] {
+        self.bytes(Sec::CatIdOffsets, Sec::CatIdBytes, i)
+    }
+
+    pub(crate) fn name(&self, i: usize) -> String {
+        self.text(Sec::CatNameOffsets, Sec::CatNameBytes, i)
+    }
+
     pub(crate) fn coord(&self, i: usize) -> Option<[f64; 2]> {
         let (lat, lon) = (self.f64_at(Sec::CatLat, i), self.f64_at(Sec::CatLon, i));
         (lat.is_finite() && lon.is_finite()).then_some([lat, lon])

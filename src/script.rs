@@ -213,7 +213,8 @@ pub fn default_display<'a>(
 
 /// A loaded feed script.
 pub struct Script {
-    _lua: Lua,
+    lua: Lua,
+    calls: u64,
     s: S,
     agency_fn: Option<Function>,
     route_fn: Option<Function>,
@@ -228,6 +229,8 @@ impl Script {
         let src =
             std::fs::read_to_string(path).with_context(|| format!("script {}", path.display()))?;
         let lua = Lua::new();
+        // many short-lived handles per trip: generational GC
+        lua.gc_gen(0, 0);
         let dir = path.parent().unwrap_or(Path::new("."));
         let base = dir.parent().unwrap_or(dir);
         let lua_err = |e: mlua::Error| anyhow::anyhow!("script {}: {e}", path.display());
@@ -250,7 +253,8 @@ impl Script {
         );
         Ok(Self {
             s: Rc::new(RefCell::new(Shared::default())),
-            _lua: lua,
+            lua,
+            calls: 0,
             agency_fn,
             route_fn,
             trip_fn,
@@ -320,6 +324,12 @@ impl Script {
         let Some(f) = self.trip_fn.clone() else {
             return Some(trip);
         };
+        // Each call leaves a few handles and strings behind; collect
+        // regularly or the garbage of millions of trips piles up (GBs).
+        self.calls += 1;
+        if self.calls.is_multiple_of(65536) {
+            let _ = self.lua.gc_collect();
+        }
         self.s.borrow_mut().trip = trip.clone();
         match f.call::<Value>(TripH(self.s.clone())) {
             Ok(Value::Boolean(false)) => None,
