@@ -45,6 +45,12 @@ rustis serve  --snapshot data/current --listen 127.0.0.1:8088 --max-concurrency 
   --reload-interval 60                # also reloads on SIGHUP
 ```
 
+Feed scripts: a dataset's `script:` in the MOTIS config (path relative to the config) is
+run at import with nigiri's Lua API (`process_agency`/`process_route`/`process_trip`;
+e.g. Transitous' scripts set train numbers such as `ICE 119`, route types and colours).
+Scripts are not bundled; put them next to the config (`scripts/*.lua`). A script that
+fails to load is reported and the feed is imported without it.
+
 ## HTTP API (loopback by default)
 
 | Method | Path | Purpose |

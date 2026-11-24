@@ -240,6 +240,13 @@ fn main() -> Result<()> {
             build,
         } => {
             let mut feeds: Vec<FeedSpec> = Vec::new();
+            let mut opts = build.options()?;
+            if let Some(cfg) = &motis_config {
+                opts.scripts = rustis::inventory::motis_scripts(
+                    &std::fs::read_to_string(cfg)?,
+                    cfg.parent().unwrap_or(std::path::Path::new(".")),
+                );
+            }
             if let Some(cfg) = motis_config {
                 let dir = feed_dir.context("--feed-dir is required with --motis-config")?;
                 for (name, path) in
@@ -271,7 +278,7 @@ fn main() -> Result<()> {
             if feeds.is_empty() {
                 bail!("no feeds given (--gtfs or --motis-config)");
             }
-            let m = build_snapshot_jobs(&feeds, &out, build.options()?, jobs, &|_| Ok(()))?;
+            let m = build_snapshot_jobs(&feeds, &out, opts, jobs, &|_| Ok(()))?;
             let failed: Vec<_> = m.feeds.iter().filter(|f| !f.imported).collect();
             println!(
                 "built {}: {} feeds ({} failed), {} stops, {} routes, {} trips, {} bitfields, {} footpaths, {} specific rules in {:.0}s",
@@ -324,6 +331,11 @@ fn main() -> Result<()> {
             if feeds.is_empty() {
                 bail!("no datasets in {}", motis_config.display());
             }
+            let mut opts = build.options()?;
+            opts.scripts = rustis::inventory::motis_scripts(
+                &std::fs::read_to_string(&motis_config)?,
+                motis_config.parent().unwrap_or(std::path::Path::new(".")),
+            );
             let cfg = rustis::update::UpdateConfig {
                 root,
                 feeds,
@@ -332,7 +344,7 @@ fn main() -> Result<()> {
                 download_jobs,
                 parse_jobs: jobs,
                 rate_limit: (rate_limit_mb * 1e6) as u64,
-                opts: build.options()?,
+                opts,
                 keep,
                 force,
             };

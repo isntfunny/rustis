@@ -125,6 +125,13 @@ pub struct Leg {
     pub trip_id: Option<String>,
     pub route_id: Option<String>,
     pub line: Option<String>,
+    /// GTFS `trip_short_name` (after the feed script), e.g. `ICE 119`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trip_short_name: Option<String>,
+    /// Name to show for the vehicle (MOTIS `displayName`): the feed script's
+    /// choice, else the line, else `trip_short_name`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
     pub mode: Option<String>,
     /// GTFS `route_type` (extended types kept).
     pub route_type: Option<u16>,

@@ -10,6 +10,7 @@ pub mod memory;
 mod model;
 pub mod motis;
 mod raptor;
+mod script;
 pub mod store;
 mod tt;
 pub mod update;

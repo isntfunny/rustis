@@ -34,7 +34,7 @@ pub const FLAG_DROP_OFF_BOOKING: u8 = 8;
 /// Change time value meaning "no transfer possible at this stop" (type 3).
 pub const FORBIDDEN: u32 = u32::MAX;
 pub const NONE: u32 = u32::MAX;
-pub const SNAPSHOT_VERSION: u32 = 7;
+pub const SNAPSHOT_VERSION: u32 = 8;
 /// Bit set in `foot_secs` for footpaths given explicitly by transfers.txt
 /// (the walk is not raised to the change time of the stop it starts at).
 pub const FOOT_EXPLICIT: u32 = 1 << 31;
@@ -59,6 +59,8 @@ pub struct BuildOptions {
     /// at 1.5 m/s in whole minutes; transfers.txt footpaths made symmetric;
     /// minute-truncated rule times; the *shortest* same-stop rule wins).
     pub motis_footpaths: bool,
+    /// MOTIS dataset scripts (`script:`), by feed name (see `crate::script`).
+    pub scripts: HashMap<String, PathBuf>,
 }
 
 impl BuildOptions {
@@ -76,6 +78,7 @@ impl BuildOptions {
             default_change_seconds: 0,
             exclude_booking_stops: false,
             motis_footpaths: false,
+            scripts: HashMap::new(),
         }
     }
 }
@@ -174,6 +177,11 @@ struct FeedData {
     gtfs_trip_ids: Vec<String>,
     /// `trip_headsign` per GTFS trip (parallel to `gtfs_trip_ids`; empty = none).
     gtfs_trip_headsigns: Vec<String>,
+    /// `trip_short_name` per GTFS trip (after the feed script; empty = none).
+    gtfs_trip_short_names: Vec<String>,
+    /// Display name per GTFS trip if it differs from the route's line
+    /// (feed script, or nigiri's fallback to `trip_short_name`); empty = line.
+    gtfs_trip_displays: Vec<String>,
     patterns: Vec<Pattern>,
     footpaths: Vec<(u32, u32, u32)>,
     forbidden: Vec<(u32, u32)>,
@@ -185,6 +193,7 @@ struct FeedData {
 }
 
 /// Display attributes of one GTFS route (or NeTEx line).
+#[derive(Clone)]
 pub(crate) struct RouteInfo {
     pub id: String,
     pub line: String,
@@ -239,6 +248,10 @@ pub struct Builder {
     n_gtfs_trips: u32,
     /// Per GTFS trip: index into `headsigns` (deduplicated strings; 0 = none).
     gtfs_trip_headsign: ArrayWriter<u32>,
+    /// Per GTFS trip: `trip_short_name` and display name (indices into
+    /// `headsigns`, the shared string pool; 0 = none / the route's line).
+    gtfs_trip_short: ArrayWriter<u32>,
+    gtfs_trip_display: ArrayWriter<u32>,
     headsigns: StrWriter,
     headsign_idx: HashMap<String, u32>,
     route_stop_off: Vec<u64>,
@@ -346,6 +359,8 @@ impl Builder {
             gtfs_trip_id: StrWriter::create(dir, "gtfs_trip_id")?,
             n_gtfs_trips: 0,
             gtfs_trip_headsign: ArrayWriter::create(dir, "gtfs_trip_headsign")?,
+            gtfs_trip_short: ArrayWriter::create(dir, "gtfs_trip_short")?,
+            gtfs_trip_display: ArrayWriter::create(dir, "gtfs_trip_display")?,
             headsigns: {
                 let mut w = StrWriter::create(dir, "headsigns")?;
                 w.push("")?;
@@ -501,12 +516,28 @@ impl Parser<'_> {
 
         // agency.txt: one time zone per feed (GTFS requires all agencies to agree).
         let mut tz_name = None::<String>;
-        let mut agencies: HashMap<Box<[u8]>, String> = HashMap::new();
-        let mut first_agency = None::<String>;
+        // feed script (MOTIS `script:`): a broken script is reported, the
+        // feed is imported without it
+        let mut script = match self.opts.scripts.get(name) {
+            Some(p) => match crate::script::Script::load(p) {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    eprintln!("feed {name}: {e:#}");
+                    skip.insert("script_load_failed".into(), 1);
+                    None
+                }
+            },
+            None => None,
+        };
+        let mut agency_list: Vec<crate::script::Agency> = Vec::new();
+        let mut agencies: HashMap<Box<[u8]>, usize> = HashMap::new();
         feed.rows("agency.txt", |c, r| {
-            let agency_name = text(r, c.get("agency_name"));
-            first_agency.get_or_insert_with(|| agency_name.clone());
-            agencies.insert(field(r, c.get("agency_id")).into(), agency_name);
+            agencies.insert(field(r, c.get("agency_id")).into(), agency_list.len());
+            agency_list.push(crate::script::Agency {
+                id: text(r, c.get("agency_id")),
+                name: text(r, c.get("agency_name")),
+                url: text(r, c.get("agency_url")),
+            });
             let t = text(r, c.get("agency_timezone"));
             match &tz_name {
                 None if !t.is_empty() => tz_name = Some(t),
@@ -518,6 +549,9 @@ impl Parser<'_> {
             Ok(())
         })?;
         let tz_name = tz_name.context("agency.txt: no agency_timezone")?;
+        if let Some(sc) = &mut script {
+            agency_list = sc.agencies(agency_list);
+        }
         let tz = self.tz_index(&tz_name)?;
         report.timezone = tz_name;
 
@@ -583,36 +617,73 @@ impl Parser<'_> {
         report.stops = stops.len() as u64;
 
         // routes.txt
-        let info_base = 0u32;
-        let mut route_infos = Vec::new();
-        let mut route_idx: HashMap<Box<[u8]>, u32> = HashMap::new();
+        let mut raw_routes: Vec<(Box<[u8]>, crate::script::Route)> = Vec::new();
         feed.rows("routes.txt", |c, r| {
             let id = field(r, c.get("route_id"));
-            let short = text(r, c.get("route_short_name"));
-            let line = if short.is_empty() {
-                text(r, c.get("route_long_name"))
-            } else {
-                short
-            };
             let rt = std::str::from_utf8(field(r, c.get("route_type")))
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(u16::MAX);
-            route_idx.insert(id.into(), info_base + route_infos.len() as u32);
             let agency = agencies
                 .get(field(r, c.get("agency_id")))
-                .or(first_agency.as_ref())
-                .cloned()
-                .unwrap_or_default();
-            route_infos.push(RouteInfo {
-                id: ns(name, &String::from_utf8_lossy(id)),
-                line,
-                route_type: rt,
-                color: text(r, c.get("route_color")),
-                agency,
-            });
+                .copied()
+                .or((!agency_list.is_empty()).then_some(0))
+                .unwrap_or(usize::MAX);
+            raw_routes.push((
+                id.into(),
+                crate::script::Route {
+                    id: String::from_utf8_lossy(id).into_owned(),
+                    short_name: text(r, c.get("route_short_name")),
+                    long_name: text(r, c.get("route_long_name")),
+                    route_type: rt,
+                    color: text(r, c.get("route_color")),
+                    text_color: text(r, c.get("route_text_color")),
+                    agency,
+                },
+            ));
             Ok(())
         })?;
+        let (keys, routes): (Vec<_>, Vec<_>) = raw_routes.into_iter().unzip();
+        let processed: Vec<Option<crate::script::Route>> = match &mut script {
+            Some(sc) => sc.routes(routes),
+            None => routes.into_iter().map(Some).collect(),
+        };
+        let mut route_infos = Vec::new();
+        // per route info: (route short name, route long name, script route index)
+        let mut route_names: Vec<(String, String, usize)> = Vec::new();
+        let mut route_idx: HashMap<Box<[u8]>, u32> = HashMap::new();
+        let mut dropped_routes = 0u64;
+        for (ri, (key, rt)) in keys.into_iter().zip(processed).enumerate() {
+            let Some(rt) = rt else {
+                dropped_routes += 1;
+                continue;
+            };
+            route_idx.insert(key, route_infos.len() as u32);
+            let agency = match &script {
+                Some(sc) => sc.agency_name(ri),
+                None => agency_list
+                    .get(rt.agency)
+                    .map(|a| a.name.clone())
+                    .unwrap_or_default(),
+            };
+            route_infos.push(RouteInfo {
+                id: ns(name, &rt.id),
+                line: if rt.short_name.is_empty() {
+                    rt.long_name.clone()
+                } else {
+                    rt.short_name.clone()
+                },
+                route_type: rt.route_type,
+                color: rt.color,
+                agency,
+            });
+            route_names.push((rt.short_name, rt.long_name, ri));
+        }
+        if dropped_routes > 0 {
+            skip.insert("script_dropped_routes".into(), dropped_routes);
+        }
+        // trip-level route type changes (script): one route info per (route, type)
+        let mut info_variants: HashMap<(u32, u16), u32> = HashMap::new();
 
         // calendar.txt + calendar_dates.txt → bitfield per service (horizon).
         let d0 = crate::feed::day_number(self.opts.first_day) - 1;
@@ -699,12 +770,52 @@ impl Parser<'_> {
         let gtfs_base = 0u32;
         let mut gtfs_trip_ids = Vec::new();
         let mut gtfs_trip_headsigns = Vec::new();
+        let mut gtfs_trip_short_names = Vec::new();
+        let mut gtfs_trip_displays = Vec::new();
         let mut trips: HashMap<Box<[u8]>, TripMeta> = HashMap::new();
         feed.rows("trips.txt", |c, r| {
             let id = field(r, c.get("trip_id"));
             let Some(&info) = route_idx.get(field(r, c.get("route_id"))) else {
                 *skip.entry("trips_unknown_route".into()).or_default() += 1;
                 return Ok(());
+            };
+            let mut info = info;
+            let route_short_empty = route_names[info as usize].0.is_empty();
+            let ri = route_names[info as usize].2;
+            let mut trip = crate::script::Trip {
+                id: String::from_utf8_lossy(id).into_owned(),
+                short_name: text(r, c.get("trip_short_name")),
+                display_name: None,
+                headsign: text(r, c.get("trip_headsign")),
+                route: ri,
+                route_type: None,
+            };
+            if let Some(sc) = script.as_mut().filter(|s| s.has_trip_fn()) {
+                match sc.trip(trip) {
+                    Some(t) => trip = t,
+                    None => {
+                        *skip.entry("script_dropped_trips".into()).or_default() += 1;
+                        return Ok(());
+                    }
+                }
+            }
+            if let Some(rt) = trip.route_type
+                && rt != route_infos[info as usize].route_type
+            {
+                info = *info_variants.entry((info, rt)).or_insert_with(|| {
+                    let mut v: RouteInfo = route_infos[info as usize].clone();
+                    v.route_type = rt;
+                    route_infos.push(v);
+                    route_names.push(route_names[info as usize].clone());
+                    (route_infos.len() - 1) as u32
+                });
+            }
+            let display = match trip.display_name {
+                Some(d) => d,
+                // nigiri: route short name, else trip short name, else long
+                // name; only the trip-short-name case differs from the line
+                None if route_short_empty && !trip.short_name.is_empty() => trip.short_name.clone(),
+                None => String::new(),
             };
             let sid = field(r, c.get("service_id"));
             let service = services.contains_key(sid).then(|| sid.into());
@@ -726,10 +837,23 @@ impl Parser<'_> {
                 bail!("duplicate trip_id {:?}", String::from_utf8_lossy(id));
             }
             gtfs_trip_ids.push(ns(name, &String::from_utf8_lossy(id)));
-            gtfs_trip_headsigns.push(text(r, c.get("trip_headsign")));
+            gtfs_trip_headsigns.push(trip.headsign);
+            gtfs_trip_short_names.push(trip.short_name);
+            gtfs_trip_displays.push(display);
             Ok(())
         })?;
         report.gtfs_trips = gtfs_trip_ids.len() as u64;
+        if let Some(sc) = &script
+            && sc.errors > 0
+        {
+            eprintln!(
+                "feed {name}: {} script error(s), first: {}",
+                sc.errors,
+                sc.first_error.as_deref().unwrap_or("")
+            );
+            skip.insert("script_errors".into(), sc.errors);
+        }
+        drop(script);
 
         // frequencies.txt
         // trip_id → (start, end, headway)
@@ -1272,6 +1396,8 @@ impl Parser<'_> {
             route_infos,
             gtfs_trip_ids,
             gtfs_trip_headsigns,
+            gtfs_trip_short_names,
+            gtfs_trip_displays,
             patterns,
             footpaths,
             forbidden,
@@ -1284,6 +1410,20 @@ impl Parser<'_> {
 }
 
 impl Builder {
+    /// Index of `s` in the shared string pool (`headsigns`; 0 = empty).
+    fn intern(&mut self, s: String) -> Result<u32> {
+        if s.is_empty() {
+            return Ok(0);
+        }
+        if let Some(&i) = self.headsign_idx.get(&s) {
+            return Ok(i);
+        }
+        let i = self.headsign_idx.len() as u32 + 1;
+        self.headsigns.push(&s)?;
+        self.headsign_idx.insert(s, i);
+        Ok(i)
+    }
+
     fn commit(&mut self, d: FeedData) -> FeedReport {
         match self.commit_inner(d) {
             Ok(r) => r,
@@ -1361,17 +1501,16 @@ impl Builder {
             self.gtfs_trip_id.push(id)?;
         }
         for h in d.gtfs_trip_headsigns {
-            let i = if h.is_empty() {
-                0
-            } else if let Some(&i) = self.headsign_idx.get(&h) {
-                i
-            } else {
-                let i = self.headsign_idx.len() as u32 + 1;
-                self.headsigns.push(&h)?;
-                self.headsign_idx.insert(h, i);
-                i
-            };
+            let i = self.intern(h)?;
             self.gtfs_trip_headsign.push(i)?;
+        }
+        for h in d.gtfs_trip_short_names {
+            let i = self.intern(h)?;
+            self.gtfs_trip_short.push(i)?;
+        }
+        for h in d.gtfs_trip_displays {
+            let i = self.intern(h)?;
+            self.gtfs_trip_display.push(i)?;
         }
         self.n_gtfs_trips += d.gtfs_trip_ids.len() as u32;
         let mut routes = 0u64;
@@ -1789,6 +1928,8 @@ impl Builder {
         self.route_info_agency.finish(m)?;
         self.gtfs_trip_id.finish(m)?;
         self.gtfs_trip_headsign.finish(m)?;
+        self.gtfs_trip_short.finish(m)?;
+        self.gtfs_trip_display.finish(m)?;
         self.headsigns.finish(m)?;
         let cat_bytes = catalog::write(&self.stops, &dir.join("catalog.bin"))?;
         let _ = cat_bytes;

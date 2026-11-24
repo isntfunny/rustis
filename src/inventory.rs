@@ -306,6 +306,33 @@ pub fn motis_datasets(config: &str) -> Vec<(String, String)> {
     out
 }
 
+/// `script:` of each dataset of a MOTIS config, resolved against `dir`
+/// (the config's directory), by dataset name.
+pub fn motis_scripts(
+    config: &str,
+    dir: &Path,
+) -> std::collections::HashMap<String, std::path::PathBuf> {
+    let (mut out, mut name) = (std::collections::HashMap::new(), None::<String>);
+    for line in config.lines() {
+        if let Some(rest) = line.strip_prefix("    ? ") {
+            name = Some(rest.trim().to_owned());
+        } else if let Some(rest) = line.strip_prefix("    ")
+            && !rest.starts_with(' ')
+            && !rest.starts_with(':')
+            && rest.trim_end().ends_with(':')
+        {
+            name = Some(rest.trim_end().trim_end_matches(':').to_owned());
+        }
+        let p = line
+            .strip_prefix("      script:")
+            .or_else(|| line.strip_prefix("    : script:"));
+        if let (Some(p), Some(n)) = (p, &name) {
+            out.insert(n.clone(), dir.join(p.trim().trim_matches(['"', '\''])));
+        }
+    }
+    out
+}
+
 /// Scans every dataset of a MOTIS config with `jobs` threads, largest ZIP
 /// first; appends one JSON line per feed to `out` as soon as it is done and
 /// skips datasets already present there (resumable).

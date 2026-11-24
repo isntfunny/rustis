@@ -550,6 +550,8 @@ impl Snapshot {
             trip_id: None,
             route_id: None,
             line: None,
+            trip_short_name: None,
+            display_name: None,
             mode: None,
             route_type: None,
             headsign: None,
@@ -713,6 +715,9 @@ impl Snapshot {
                     leg.route_type = Some(tt.route_info_type[info]);
                     leg.intermediate_stops = intermediate;
                     let gtfs = tt.trip_gtfs[trip as usize] as usize;
+                    let pooled = |i: u32| (i != 0).then(|| tt.headsigns.get(i as usize).to_owned());
+                    leg.trip_short_name = pooled(tt.gtfs_trip_short[gtfs]);
+                    leg.display_name = pooled(tt.gtfs_trip_display[gtfs]).or(leg.line.clone());
                     let h = tt.gtfs_trip_headsign[gtfs] as usize;
                     leg.headsign = Some(if h != 0 {
                         tt.headsigns.get(h).to_owned()

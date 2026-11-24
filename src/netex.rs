@@ -463,6 +463,8 @@ pub(super) fn read(p: &mut Parser<'_>, spec: &FeedSpec) -> Result<FeedData> {
     let mut pattern_idx = HashMap::new();
     let mut gtfs_trip_ids = Vec::new();
     let mut gtfs_trip_headsigns = Vec::new();
+    let mut gtfs_trip_short_names = Vec::new();
+    let mut gtfs_trip_displays = Vec::new();
     scan(&spec.path, &["ServiceJourney"], |n| {
         report.gtfs_trips += 1;
         let mut bits = vec![0u64; p.words];
@@ -626,6 +628,8 @@ pub(super) fn read(p: &mut Parser<'_>, spec: &FeedSpec) -> Result<FeedData> {
         let gtfs = gtfs_trip_ids.len() as u32;
         gtfs_trip_ids.push(ns(&spec.name, &n.id));
         gtfs_trip_headsigns.push(String::new());
+        gtfs_trip_short_names.push(String::new());
+        gtfs_trip_displays.push(String::new());
         report.stop_times += (flat.len() / 2) as u64;
         for (times, days) in time_variants(
             &flat,
@@ -665,6 +669,8 @@ pub(super) fn read(p: &mut Parser<'_>, spec: &FeedSpec) -> Result<FeedData> {
         route_infos,
         gtfs_trip_ids,
         gtfs_trip_headsigns,
+        gtfs_trip_short_names,
+        gtfs_trip_displays,
         patterns,
         footpaths: Vec::new(),
         forbidden: Vec::new(),

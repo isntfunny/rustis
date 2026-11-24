@@ -348,7 +348,10 @@ fn leg_json(ids: &Ids, l: &Leg, start: Option<[f64; 2]>, end: Option<[f64; 2]>) 
         v["interlineWithPreviousLeg"] = json!(false);
         v["headsign"] = json!(l.headsign);
         v["routeShortName"] = json!(line);
-        v["displayName"] = json!(line);
+        v["displayName"] = json!(l.display_name.as_deref().unwrap_or(&line));
+        if let Some(t) = &l.trip_short_name {
+            v["tripShortName"] = json!(t);
+        }
         v["routeType"] = json!(l.route_type);
         v["tripId"] = json!(l.trip_id.as_deref().map(|t| ids.motis_id(t)));
         v["routeId"] = json!(l.route_id.as_deref().map(|t| ids.motis_id(t)));

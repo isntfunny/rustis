@@ -78,6 +78,10 @@ pub struct Timetable {
     pub route_info_agency: Strs,
     pub gtfs_trip_id: Strs,
     pub gtfs_trip_headsign: Array<u32>,
+    /// `trip_short_name` / display name per GTFS trip (index into
+    /// `headsigns`, the shared string pool; 0 = none / the route's line).
+    pub gtfs_trip_short: Array<u32>,
+    pub gtfs_trip_display: Array<u32>,
     pub headsigns: Strs,
     /// Unix seconds that relative time 0 corresponds to.
     pub origin: i64,
@@ -181,6 +185,8 @@ impl Timetable {
             route_info_agency: Strs::open(dir, "route_info_agency", m)?,
             gtfs_trip_id: Strs::open(dir, "gtfs_trip_id", m)?,
             gtfs_trip_headsign: a!("gtfs_trip_headsign"),
+            gtfs_trip_short: a!("gtfs_trip_short"),
+            gtfs_trip_display: a!("gtfs_trip_display"),
             headsigns: Strs::open(dir, "headsigns", m)?,
             origin,
             base,
