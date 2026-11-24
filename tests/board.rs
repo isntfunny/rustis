@@ -210,3 +210,48 @@ async fn implausible_transfers_are_dropped() {
     let (_, json) = get(&app, "/v1/debug/transfer?from=ULM1&to=ULM2").await;
     assert_eq!(json["footpath_secs"], 120, "{json}");
 }
+
+fn geocode_app() -> (TempDir, axum::Router) {
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("snapshot");
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/geocode");
+    import_gtfs(&fixture, &path, "2026-11-16").unwrap();
+    let app = rustis::http::router(Arc::new(Snapshot::open(&path).unwrap()), 1);
+    (tmp, app)
+}
+
+#[tokio::test]
+async fn geocode_prefers_the_towns_train_station() {
+    let (_tmp, app) = geocode_app();
+    // a busier bus stop named exactly `Ulm` elsewhere loses to the station
+    // of the town Ulm
+    let (_, json) = get(&app, "/api/v1/geocode?text=Ulm").await;
+    assert_eq!(json[0]["id"], "x:de:08421:1008", "{json}");
+    // only stations with trains
+    let (_, json) = get(&app, "/api/v1/geocode?text=Ulm&mode=RAIL").await;
+    let ids: Vec<&str> = json
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| x["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["x:de:08421:1008"], "{json}");
+    let (_, json) = get(&app, "/api/v1/geocode?text=Ulm&mode=BUS").await;
+    assert!(
+        json.as_array().unwrap().iter().any(|x| x["id"] == "fr:ulm"),
+        "{json}"
+    );
+    let (_, json) = get(&app, "/api/v1/geocode?text=Ulm&type=ADDRESS").await;
+    assert_eq!(json.as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn geocode_merges_foreign_copies_of_a_station() {
+    let (_tmp, app) = geocode_app();
+    // `Köln Messe/Deutz` and the truncated `Köln Messe/De Gl.11-12` of
+    // another feed are the same station as `Köln Messe/Deutz Bf`
+    let (_, json) = get(&app, "/api/v1/geocode?text=K%C3%B6ln%20Mess").await;
+    let m = json.as_array().unwrap();
+    assert_eq!(m.len(), 1, "{json}");
+    assert_eq!(m[0]["name"], "Köln Messe/Deutz Bf");
+}

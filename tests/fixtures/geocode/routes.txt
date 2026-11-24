@@ -1,0 +1,5 @@
+route_id,agency_id,route_short_name,route_long_name,route_type
+RE,db,RE5,,2
+BUS,db,1,,3
+FRBUS,db,A,,3
+NL,db,ICE,,2

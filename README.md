@@ -96,7 +96,7 @@ POST /v1/plan
 
 | Method | Path | Purpose |
 | --- | --- | --- |
-| GET | `/api/v1/geocode?text=ulm%20hbf&limit=10` | station autocomplete: one entry per station, `[{type:"STOP", id, name, lat, lon, score, areas:[{name}]}]` |
+| GET | `/api/v1/geocode?text=ulm%20hbf&limit=10&mode=RAIL` | station autocomplete: one entry per station, `[{type:"STOP", id, name, lat, lon, score, areas:[{name}]}]`; busy and train stations first, the town's stations first when the text is a town; optional `mode` (comma list of MOTIS modes) keeps only stations served by them; `type` other than `STOP` gives `[]` |
 | GET | `/api/v6/stoptimes?stopId=…&time=…&n=10[&arriveBy=true]` | departures (arrivals) of the station the stop belongs to: `displayName`, `tripShortName`, `headsign`, `place.departure`/`arrival`, `place.track`, `tripTo`, `tripId`, `deutschlandticket` |
 | GET | `/api/v6/trip?tripId=…` | a whole trip as a one-leg itinerary with every stop and its times |
 | GET | `/api/v1/trip-by-name?name=ICE%20930&date=YYYY-MM-DD[&stopId=…]` | Rustis extension: trips of a service date by train name (`ICE 930`, `RE1 4711`) or number (`930`), optionally calling at a station (`stop` = that call) |

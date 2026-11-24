@@ -100,10 +100,10 @@ impl Snapshot {
     }
 
     /// Stations matching free text, best first: (station, score).
-    pub(crate) fn geocode(&self, text: &str, limit: usize) -> Vec<(Station, f64)> {
+    pub(crate) fn geocode(&self, text: &str, limit: usize, modes: u32) -> Vec<(Station, f64)> {
         let tt = self.tt();
         tt.ix
-            .geocode(text, limit)
+            .geocode(text, limit, modes)
             .into_iter()
             .map(|(g, score)| (self.group_station(g), score))
             .collect()

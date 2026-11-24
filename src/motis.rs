@@ -170,7 +170,7 @@ pub fn mode(route_type: u16) -> &'static str {
     }
 }
 
-const RAIL: [&str; 7] = [
+pub(crate) const RAIL: [&str; 7] = [
     "RAIL",
     "HIGHSPEED_RAIL",
     "LONG_DISTANCE",
@@ -592,6 +592,11 @@ pub struct GeocodeQuery {
     pub text: String,
     /// Number of matches (default 10, at most 50).
     pub limit: Option<usize>,
+    /// Only `STOP` is supported; other types give no results.
+    #[serde(rename = "type")]
+    pub kind: Option<String>,
+    /// Only stations served by one of these modes (comma list, e.g. `RAIL`).
+    pub mode: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -729,8 +734,21 @@ fn trip_fields(snap: &Snapshot, ids: &Ids, at: &crate::board::TripRef, v: &mut V
 pub fn geocode(snap: &Snapshot, q: &GeocodeQuery) -> Result<Value, Error> {
     let ids = Ids::new(snap);
     let limit = q.limit.unwrap_or(10).clamp(1, 50);
+    if q.kind
+        .as_deref()
+        .is_some_and(|k| !k.eq_ignore_ascii_case("STOP"))
+    {
+        return Ok(Value::Array(Vec::new()));
+    }
+    let modes = match &q.mode {
+        None => u32::MAX,
+        Some(m) => {
+            let list: Vec<String> = m.split(',').map(|x| x.trim().to_uppercase()).collect();
+            crate::search::mode_mask(|x| allowed(&list, x))
+        }
+    };
     Ok(Value::Array(
-        snap.geocode(&q.text, limit)
+        snap.geocode(&q.text, limit, modes)
             .iter()
             .map(|(st, score)| {
                 let p = station_place(snap, &ids, st);

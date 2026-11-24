@@ -34,7 +34,7 @@ pub const FLAG_DROP_OFF_BOOKING: u8 = 8;
 /// Change time value meaning "no transfer possible at this stop" (type 3).
 pub const FORBIDDEN: u32 = u32::MAX;
 pub const NONE: u32 = u32::MAX;
-pub const SNAPSHOT_VERSION: u32 = 9;
+pub const SNAPSHOT_VERSION: u32 = 10;
 
 /// Explicit footpaths faster than this (plus 500 m) are treated as data errors.
 pub const MAX_TRANSFER_SPEED_M_PER_S: f64 = 5.0;

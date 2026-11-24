@@ -1,0 +1,8 @@
+stop_id,stop_name,stop_lat,stop_lon,location_type,parent_station,platform_code
+x:de:08421:1008,Ulm Hauptbahnhof,48.3994,9.9829,0,,
+x:de:08421:2000,Ulm Ehinger Tor,48.3960,9.9850,0,,
+fr:ulm,Ulm,46.6700,-1.4260,0,,
+x:de:05315:11201,Köln Messe/Deutz Bf,50.9409,6.9750,0,,
+nl:koeln1,Köln Messe/Deutz,50.9411,6.9752,0,,
+nl:koeln2,Köln Messe/De Gl.11-12,50.9413,6.9749,0,,
+fr:ulm2,La Roche Gare,46.6800,-1.4300,0,,

@@ -31,6 +31,8 @@ pub struct Index {
     pub group_members: Array<u32>,
     pub group_rep: Array<u32>,
     pub group_weight: Array<u32>,
+    /// MOTIS modes serving a station (bit `i` = `MODES[i]`).
+    pub group_modes: Array<u32>,
     /// Town of a station (index into `area_name`, `NONE` = unknown).
     pub group_area: Array<u32>,
     pub area_name: Strs,
@@ -53,6 +55,7 @@ impl Index {
             group_members: Array::open(dir, "group_members", m)?,
             group_rep: Array::open(dir, "group_rep", m)?,
             group_weight: Array::open(dir, "group_weight", m)?,
+            group_modes: Array::open(dir, "group_modes", m)?,
             group_area: Array::open(dir, "group_area", m)?,
             area_name: Strs::open(dir, "area_name", m)?,
             geo_key: Strs::open(dir, "geo_key", m)?,
@@ -98,8 +101,12 @@ impl Index {
     }
 
     /// Stations matching a free-text query, best first: `(group, score)`.
-    pub fn geocode(&self, query: &str, limit: usize) -> Vec<(u32, f64)> {
+    /// Only stations served by one of the modes in `modes` (bit set over
+    /// `MODES`) are returned.
+    pub fn geocode(&self, query: &str, limit: usize, modes: u32) -> Vec<(u32, f64)> {
         let mut best: HashMap<u32, f64> = HashMap::new();
+        let rail = mode_mask(|m| crate::motis::RAIL.contains(&m));
+        let mut town_is: HashMap<u32, bool> = HashMap::new();
         for q in query_variants(query) {
             let tokens: Vec<&str> = q.split(' ').filter(|t| !t.is_empty()).collect();
             let Some(primary) = tokens.iter().max_by_key(|t| t.len()) else {
@@ -126,7 +133,25 @@ impl Index {
                     continue;
                 }
                 let g = self.geo_key_group[key_id];
-                let mut score = f64::from(self.group_weight[g as usize]).ln_1p();
+                let gm = self.group_modes[g as usize];
+                if gm & modes == 0 {
+                    continue;
+                }
+                // busy stations and train stations first
+                let mut score = 2.0 * f64::from(self.group_weight[g as usize]).ln_1p();
+                if gm & rail != 0 {
+                    score += 15.0;
+                }
+                // the query is the station's town (`Ulm` → `Ulm Hbf` before a
+                // bus stop `Ulm` in France)
+                let a = self.group_area[g as usize];
+                if a != NONE
+                    && *town_is
+                        .entry(a)
+                        .or_insert_with(|| norm(self.area_name.get(a as usize)) == q)
+                {
+                    score += 60.0;
+                }
                 if key == q {
                     score += 100.0;
                 } else if key.starts_with(q.as_str()) {
@@ -152,6 +177,48 @@ impl Index {
         out.truncate(limit);
         out
     }
+}
+
+/// Words starting a platform suffix of a stop name (`Gl. 11-12`).
+const PLATFORM_WORDS: &[&str] = &[
+    "gl", "gleis", "bstg", "bussteig", "steig", "spoor", "perron", "track", "platform", "quai",
+    "voie",
+];
+
+/// MOTIS modes as returned by `motis::mode`, bit `i` in `group_modes`.
+pub const MODES: [&str; 16] = [
+    "TRAM",
+    "SUBWAY",
+    "METRO",
+    "REGIONAL_RAIL",
+    "HIGHSPEED_RAIL",
+    "LONG_DISTANCE",
+    "NIGHT_RAIL",
+    "SUBURBAN",
+    "BUS",
+    "COACH",
+    "FERRY",
+    "AIRPLANE",
+    "AERIAL_LIFT",
+    "FUNICULAR",
+    "RAIL",
+    "OTHER",
+];
+
+fn mode_bit(m: &str) -> u32 {
+    MODES
+        .iter()
+        .position(|&x| x == m)
+        .map_or(1 << 15, |i| 1 << i)
+}
+
+/// Bit set of the modes `ok` accepts.
+pub fn mode_mask(ok: impl Fn(&str) -> bool) -> u32 {
+    MODES
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| ok(m))
+        .fold(0, |a, (i, _)| a | 1 << i)
 }
 
 /// Query token `t` matches name word `w`: a prefix of it, or `bf` for
@@ -467,6 +534,14 @@ fn write_stations(dir: &Path, m: &mut Manifest, n: usize) -> Result<()> {
             })
             .sum()
     };
+    let modes = |s: usize| -> u32 {
+        (stop_route_off[s] as usize..stop_route_off[s + 1] as usize)
+            .map(|k| {
+                let t = route_info_type[route_info[stop_route[k] as usize] as usize];
+                mode_bit(crate::motis::mode(t))
+            })
+            .fold(0, |a, b| a | b)
+    };
     let parent = |s: usize| -> Option<usize> { cat.parent(s) };
     let mut uf = Uf((0..n as u32).collect());
     let mut include = vec![false; n];
@@ -551,6 +626,9 @@ fn write_stations(dir: &Path, m: &mut Manifest, n: usize) -> Result<()> {
             .map(|&a| norm(&area_names[a as usize]))
     };
     let mut named: Vec<(String, bool, u32, f64, f64)> = Vec::new();
+    // names cut before a platform suffix (`Köln Messe/De Gl.11-12`): may be
+    // truncated, matched as a prefix below
+    let mut cut: Vec<(String, u32, f64, f64)> = Vec::new();
     for s in (0..n).filter(|&s| served(s) && !keys[s].is_empty()) {
         let Some([lat, lon]) = cat.coord(s) else {
             continue;
@@ -560,6 +638,20 @@ fn write_stations(dir: &Path, m: &mut Manifest, n: usize) -> Result<()> {
         let words: Vec<&str> = k.split(' ').collect();
         for i in 1..words.len().saturating_sub(1) {
             named.push((words[i..].join(" "), true, s as u32, lat, lon));
+        }
+        // `Köln Messe/Deutz Bf` ~ `Köln Messe/Deutz` (foreign feed copies)
+        if words.len() >= 2 && matches!(*words.last().unwrap(), "bf" | "hbf") {
+            named.push((words[..words.len() - 1].join(" "), true, s as u32, lat, lon));
+        }
+        if let Some(i) = (2..words.len().saturating_sub(1)).find(|&i| {
+            PLATFORM_WORDS.contains(&words[i])
+                && words[i + 1].starts_with(|c: char| c.is_ascii_digit())
+        }) {
+            let base = words[..i].join(" ");
+            named.push((base.clone(), true, s as u32, lat, lon));
+            if base.len() >= 8 {
+                cut.push((base, s as u32, lat, lon));
+            }
         }
         if let Some(t) = stop_town(s)
             && !k.starts_with(&format!("{t} "))
@@ -599,6 +691,18 @@ fn write_stations(dir: &Path, m: &mut Manifest, n: usize) -> Result<()> {
         }
         i = j;
     }
+    for (base, s, lat, lon) in cut {
+        let lo = named.partition_point(|x| x.0.as_str() < base.as_str());
+        for x in named[lo..]
+            .iter()
+            .take_while(|x| x.0.starts_with(base.as_str()))
+            .take(64)
+        {
+            if !x.1 && haversine([lat, lon], [x.3, x.4]) <= MERGE_RADIUS_M {
+                uf.union(s, x.2);
+            }
+        }
+    }
     drop(named);
     // groups
     let mut group_of_root: HashMap<u32, u32> = HashMap::new();
@@ -630,18 +734,24 @@ fn write_stations(dir: &Path, m: &mut Manifest, n: usize) -> Result<()> {
     let mut group_members = Vec::new();
     let mut group_rep = Vec::with_capacity(ng);
     let mut group_weight = Vec::with_capacity(ng);
+    let mut group_modes = Vec::with_capacity(ng);
     let mut key_strs: Vec<(String, u32)> = Vec::new();
     group_off.push(0u32);
     for g in 0..ng {
         let mem = &members[g];
         let w: Vec<u64> = mem.iter().map(|&s| weight(s as usize)).collect();
         let total: u64 = w.iter().sum();
-        // representative: the parent station carrying most service, else the
-        // busiest stop; ties by id (stable across rebuilds)
+        // representative: a stop with a DHID (`de:08421:1008`, the national
+        // feed rather than a foreign copy), then the parent station carrying
+        // most service, else the busiest stop; ties by id (stable across
+        // rebuilds)
+        let dhid = |s: u32| area_code(cat.id_bytes(s as usize)).is_some();
         let pick = |cands: &mut dyn Iterator<Item = (u32, u64)>| {
             cands
                 .max_by(|a, b| {
-                    a.1.cmp(&b.1)
+                    dhid(a.0)
+                        .cmp(&dhid(b.0))
+                        .then(a.1.cmp(&b.1))
                         .then_with(|| cat.id_bytes(b.0 as usize).cmp(cat.id_bytes(a.0 as usize)))
                 })
                 .map(|x| x.0)
@@ -661,6 +771,7 @@ fn write_stations(dir: &Path, m: &mut Manifest, n: usize) -> Result<()> {
         .unwrap_or(mem[0]);
         group_rep.push(rep);
         group_weight.push(total.min(u64::from(u32::MAX)) as u32);
+        group_modes.push(mem.iter().fold(0, |a, &s| a | modes(s as usize)));
         group_members.extend_from_slice(mem);
         group_off.push(group_members.len() as u32);
         let mut ks: Vec<String> = mem
@@ -697,6 +808,7 @@ fn write_stations(dir: &Path, m: &mut Manifest, n: usize) -> Result<()> {
     write_all(dir, "group_members", &group_members, m)?;
     write_all(dir, "group_rep", &group_rep, m)?;
     write_all(dir, "group_weight", &group_weight, m)?;
+    write_all(dir, "group_modes", &group_modes, m)?;
     write_all(dir, "group_area", &group_area, m)?;
     let mut off = ArrayWriter::<u64>::create(dir, "area_name.off")?;
     let mut bytes = ArrayWriter::<u8>::create(dir, "area_name.bytes")?;
@@ -713,6 +825,7 @@ fn write_stations(dir: &Path, m: &mut Manifest, n: usize) -> Result<()> {
         group_members,
         group_rep,
         group_weight,
+        group_modes,
     ));
     // word-start entries, sorted by the text from the word on
     let mut entries: Vec<u64> = Vec::new();
