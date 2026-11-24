@@ -121,7 +121,14 @@ impl Snapshot {
     /// The next `n` departures (or arrivals) at `stops` from `t` on, in time
     /// order. Events at a trip's last stop (first stop) and where boarding
     /// (alighting) is not allowed are left out.
-    pub(crate) fn board(&self, stops: &[u32], t: u32, n: usize, arrivals: bool) -> Vec<Event> {
+    pub(crate) fn board(
+        &self,
+        stops: &[u32],
+        t: u32,
+        n: usize,
+        arrivals: bool,
+        route_type_ok: &dyn Fn(u16) -> bool,
+    ) -> Vec<Event> {
         let tt = self.tt();
         let mut out: Vec<Event> = Vec::new();
         let mut pairs: Vec<(u32, u32, u32)> = Vec::new(); // (stop, route, pos)
@@ -139,7 +146,7 @@ impl Snapshot {
                 } else {
                     p == last || f & FLAG_NO_PICKUP != 0
                 };
-                if !skip {
+                if !skip && route_type_ok(tt.route_info_type[tt.route_info[r as usize] as usize]) {
                     pairs.push((s, r, p));
                 }
             }
@@ -300,8 +307,14 @@ impl Snapshot {
                 out.push((at, pos));
             }
         }
-        out.sort_by_key(|(at, _)| at.times(tt, 0).1);
-        out.dedup_by_key(|(at, _)| at.trip);
+        // the same train from several feeds: one entry (the longest run)
+        out.sort_by_key(|(at, _)| {
+            (
+                at.times(tt, 0).1,
+                std::cmp::Reverse(tt.n_route_stops(at.route as usize)),
+            )
+        });
+        out.dedup_by_key(|(at, _)| at.times(tt, 0).1);
         out.truncate(limit);
         out
     }

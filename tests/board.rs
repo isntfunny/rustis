@@ -56,6 +56,8 @@ async fn geocode_returns_one_entry_per_station() {
     assert_eq!(json[0]["id"], "FH");
     let (_, json) = get(&app, "/api/v1/geocode?text=neu%20ulm").await;
     assert_eq!(json[0]["id"], "NU");
+    // `S+U Neu-Ulm` 30 m away is the same station
+    assert_eq!(json.as_array().unwrap().len(), 1, "{json}");
     let (_, json) = get(&app, "/api/v1/geocode?text=nowhere").await;
     assert_eq!(json.as_array().unwrap().len(), 0);
 }
@@ -109,6 +111,19 @@ async fn departure_board_covers_the_whole_station() {
     assert_eq!(st[0]["place"]["arrival"], "2026-11-16T13:00:00Z");
     assert_eq!(st[1]["place"]["arrival"], "2026-11-16T14:00:00Z");
 
+    // mode filter
+    let (_, json) = get(
+        &app,
+        "/api/v6/stoptimes?stopId=ULM&time=2026-11-16T08:30:00Z&n=3&mode=BUS",
+    )
+    .await;
+    assert_eq!(json["stopTimes"].as_array().unwrap().len(), 0, "{json}");
+    let (_, json) = get(
+        &app,
+        "/api/v6/stoptimes?stopId=ULM&time=2026-11-16T08:30:00Z&n=3&mode=RAIL",
+    )
+    .await;
+    assert_eq!(json["stopTimes"].as_array().unwrap().len(), 3, "{json}");
     let (status, _) = get(&app, "/api/v6/stoptimes?stopId=nope").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }

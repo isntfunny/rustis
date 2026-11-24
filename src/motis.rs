@@ -603,6 +603,8 @@ pub struct StopTimesQuery {
     pub n: Option<usize>,
     /// `true`: arrivals instead of departures.
     pub arrive_by: Option<bool>,
+    /// Comma-separated MOTIS modes (e.g. `RAIL`); default all.
+    pub mode: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -770,7 +772,14 @@ pub fn stoptimes(snap: &Snapshot, q: &StopTimesQuery) -> Result<Value, Error> {
     // the same ride from duplicate feeds is shown once
     let mut seen = std::collections::HashSet::new();
     let mut out = Vec::new();
-    for e in snap.board(&st.stops, t, 2 * n, arrivals) {
+    let modes: Option<Vec<String>> = q.mode.as_deref().map(|m| {
+        m.split(',')
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty())
+            .collect()
+    });
+    let type_ok = |t: u16| modes.as_ref().is_none_or(|m| allowed(m, mode(t)));
+    for e in snap.board(&st.stops, t, 2 * n, arrivals, &type_ok) {
         let (a, d) = e.at.times(tt, e.pos as usize);
         let last = tt.n_route_stops(e.at.route as usize) - 1;
         let mut v = json!({});

@@ -21,6 +21,9 @@ use std::path::Path;
 
 /// Same-name stops closer than this are one station.
 pub const STATION_RADIUS_M: f64 = 500.0;
+/// Stops whose names match only after dropping leading words or adding the
+/// town are one station if closer than this.
+pub const MERGE_RADIUS_M: f64 = 300.0;
 
 pub struct Index {
     pub stop_group: Array<u32>,
@@ -248,10 +251,22 @@ fn query_variants(q: &str) -> Vec<String> {
 /// Name key of a trip for the train-number search: alphanumerics only,
 /// lower case (`ICE 930` → `ice930`).
 pub fn name_key(s: &str) -> String {
-    s.chars()
+    let mut out = String::new();
+    let mut prev_digit = false;
+    for c in s
+        .chars()
         .filter(|c| c.is_alphanumeric())
         .flat_map(char::to_lowercase)
-        .collect()
+    {
+        let digit = c.is_ascii_digit();
+        // leading zeros of a number are dropped (`RE 014506` = `RE 14506`)
+        if c == '0' && !prev_digit {
+            continue;
+        }
+        prev_digit = digit;
+        out.push(c);
+    }
+    out
 }
 
 fn haversine(a: [f64; 2], b: [f64; 2]) -> f64 {
@@ -475,62 +490,6 @@ fn write_stations(dir: &Path, m: &mut Manifest, n: usize) -> Result<()> {
             }
         }
     }
-    // same name within the radius
-    let mut named: Vec<(u32, f64, f64)> = (0..n)
-        .filter(|&s| served(s) && !keys[s].is_empty())
-        .filter_map(|s| cat.coord(s).map(|[a, b]| (s as u32, a, b)))
-        .collect();
-    named.sort_by(|a, b| {
-        keys[a.0 as usize]
-            .cmp(&keys[b.0 as usize])
-            .then(a.1.total_cmp(&b.1))
-    });
-    let dlat = STATION_RADIUS_M / 111_000.0;
-    let mut i = 0;
-    while i < named.len() {
-        let mut j = i;
-        while j < named.len() && keys[named[j].0 as usize] == keys[named[i].0 as usize] {
-            j += 1;
-        }
-        for a in i..j {
-            for b in a + 1..j {
-                if named[b].1 - named[a].1 > dlat {
-                    break;
-                }
-                if haversine([named[a].1, named[a].2], [named[b].1, named[b].2]) <= STATION_RADIUS_M
-                {
-                    uf.union(named[a].0, named[b].0);
-                }
-            }
-        }
-        i = j;
-    }
-    drop(named);
-    // groups
-    let mut group_of_root: HashMap<u32, u32> = HashMap::new();
-    let mut stop_group = vec![NONE; n];
-    let mut members: Vec<Vec<u32>> = Vec::new();
-    let mut parents: Vec<Vec<u32>> = Vec::new();
-    for s in 0..n {
-        if !include[s] {
-            continue;
-        }
-        let r = uf.find(s as u32);
-        let g = *group_of_root.entry(r).or_insert_with(|| {
-            members.push(Vec::new());
-            parents.push(Vec::new());
-            (members.len() - 1) as u32
-        });
-        stop_group[s] = g;
-        if served(s) {
-            members[g as usize].push(s as u32);
-        } else {
-            parents[g as usize].push(s as u32);
-        }
-    }
-    drop(group_of_root);
-    drop(uf);
-    let ng = members.len();
     // Towns from DHID municipality codes (`de:08111:…`): the first word most
     // stop names of the code start with (`Stuttgart`). Networks that name
     // stops without the town (`Hauptbahnhof (tief)`) become findable as
@@ -581,6 +540,91 @@ fn write_stations(dir: &Path, m: &mut Manifest, n: usize) -> Result<()> {
         }
     }
     drop(area_total);
+    // Same station: stops with the same name within the radius, and stops
+    // within `MERGE_RADIUS_M` whose names match after dropping leading words
+    // (`S+U Berlin Hauptbahnhof` ~ `Berlin Hbf`) or adding the town
+    // (`Hauptbahnhof` in Stuttgart ~ `Stuttgart Hbf` of another feed); at
+    // least one of the two must carry that name itself.
+    let stop_town = |s: usize| -> Option<String> {
+        area_code(cat.id_bytes(s))
+            .and_then(|c| area_of_code.get(c))
+            .map(|&a| norm(&area_names[a as usize]))
+    };
+    let mut named: Vec<(String, bool, u32, f64, f64)> = Vec::new();
+    for s in (0..n).filter(|&s| served(s) && !keys[s].is_empty()) {
+        let Some([lat, lon]) = cat.coord(s) else {
+            continue;
+        };
+        let k = &keys[s];
+        named.push((k.clone(), false, s as u32, lat, lon));
+        let words: Vec<&str> = k.split(' ').collect();
+        for i in 1..words.len().saturating_sub(1) {
+            named.push((words[i..].join(" "), true, s as u32, lat, lon));
+        }
+        if let Some(t) = stop_town(s)
+            && !k.starts_with(&format!("{t} "))
+            && *k != t
+        {
+            named.push((format!("{t} {k}"), true, s as u32, lat, lon));
+        }
+    }
+    named.sort_by(|a, b| a.0.cmp(&b.0).then(a.3.total_cmp(&b.3)));
+    let dlat = STATION_RADIUS_M / 111_000.0;
+    let mut i = 0;
+    while i < named.len() {
+        let mut j = i;
+        while j < named.len() && named[j].0 == named[i].0 {
+            j += 1;
+        }
+        if named[i..j].iter().any(|x| !x.1) {
+            for a in i..j {
+                for b in a + 1..j {
+                    let (x, y) = (&named[a], &named[b]);
+                    if y.3 - x.3 > dlat {
+                        break;
+                    }
+                    if x.1 && y.1 {
+                        continue;
+                    }
+                    let max = if x.1 || y.1 {
+                        MERGE_RADIUS_M
+                    } else {
+                        STATION_RADIUS_M
+                    };
+                    if haversine([x.3, x.4], [y.3, y.4]) <= max {
+                        uf.union(x.2, y.2);
+                    }
+                }
+            }
+        }
+        i = j;
+    }
+    drop(named);
+    // groups
+    let mut group_of_root: HashMap<u32, u32> = HashMap::new();
+    let mut stop_group = vec![NONE; n];
+    let mut members: Vec<Vec<u32>> = Vec::new();
+    let mut parents: Vec<Vec<u32>> = Vec::new();
+    for s in 0..n {
+        if !include[s] {
+            continue;
+        }
+        let r = uf.find(s as u32);
+        let g = *group_of_root.entry(r).or_insert_with(|| {
+            members.push(Vec::new());
+            parents.push(Vec::new());
+            (members.len() - 1) as u32
+        });
+        stop_group[s] = g;
+        if served(s) {
+            members[g as usize].push(s as u32);
+        } else {
+            parents[g as usize].push(s as u32);
+        }
+    }
+    drop(group_of_root);
+    drop(uf);
+    let ng = members.len();
     let mut group_area = Vec::with_capacity(ng);
     let mut group_off = Vec::with_capacity(ng + 1);
     let mut group_members = Vec::new();
@@ -816,6 +860,8 @@ mod tests {
         assert_eq!(norm("Frankfurt(M) Hauptbahnhof"), "frankfurt m hbf");
         assert_eq!(query_variants("Muenchen"), vec!["muenchen", "munchen"]);
         assert_eq!(name_key("ICE 930"), "ice930");
+        assert_eq!(name_key("RE 014506"), "re14506");
+        assert_eq!(name_key("S 10"), "s10");
         assert_eq!(area_code(b"de-DELFI:de:08111:6115"), Some(&b"de:08111"[..]));
         assert_eq!(area_code(b"de-DELFI:de:08111"), Some(&b"de:08111"[..]));
         assert_eq!(area_code(b"de-VBB:900100001"), None);
