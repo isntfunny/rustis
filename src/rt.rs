@@ -289,7 +289,7 @@ fn compute(
             2 | 3 => continue, // NO_DATA / UNSCHEDULED: carry the delay
             _ => {}
         }
-        let mut one = |ev: &Option<Ev>, sched_t: u32| -> Result<Option<i64>, ()> {
+        let one = |ev: &Option<Ev>, sched_t: u32| -> Result<Option<i64>, ()> {
             let Some(e) = ev else { return Ok(None) };
             let t = e.time.map(|t| t - tt.origin);
             match (e.delay, t) {
