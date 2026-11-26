@@ -194,6 +194,13 @@ enum Cmd {
         /// switch to it without restart; SIGHUP checks immediately. 0 = off.
         #[arg(long, default_value_t = 60)]
         reload_interval: u64,
+        /// GTFS-RT TripUpdates feed: `URL` or `URL|ID_PREFIX` (the prefix of
+        /// the feed's ids in the snapshot, e.g. `de-DELFI:`). Repeatable.
+        #[arg(long = "rt")]
+        rt: Vec<rustis::rt::RtSource>,
+        /// Seconds between realtime fetches.
+        #[arg(long, default_value_t = 60)]
+        rt_interval: u64,
     },
 }
 
@@ -468,12 +475,17 @@ fn main() -> Result<()> {
             max_concurrency,
             max_labels,
             reload_interval,
+            rt,
+            rt_interval,
         } => {
             let handle = Arc::new(rustis::http::SnapshotHandle::new(
                 Snapshot::open(&snapshot)?,
                 Some(snapshot.clone()),
                 max_labels,
             ));
+            if !rt.is_empty() {
+                rustis::rt::spawn_updater(handle.clone(), rt, rt_interval.max(10));
+            }
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(2)
                 .max_blocking_threads(max_concurrency.max(1) + 1)

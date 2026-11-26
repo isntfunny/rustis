@@ -161,6 +161,24 @@ pub struct Leg {
     /// `[lat, lon]` of every served stop along the leg; not a vehicle track.
     pub geometry: Vec<[f64; 2]>,
     pub geometry_source: &'static str,
+    /// Realtime: the times above differ from the schedule below, or the
+    /// feed confirmed them.
+    #[serde(skip)]
+    pub real_time: bool,
+    /// Scheduled departure/arrival (ISO) of a realtime ride.
+    #[serde(skip)]
+    pub scheduled_times: Option<(String, String)>,
+    /// Platform at boarding / alighting and the scheduled ones.
+    #[serde(skip)]
+    pub tracks: Option<LegTracks>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct LegTracks {
+    pub from: Option<String>,
+    pub scheduled_from: Option<String>,
+    pub to: Option<String>,
+    pub scheduled_to: Option<String>,
 }
 
 #[derive(Debug, Serialize)]

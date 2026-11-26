@@ -6,6 +6,7 @@
 //! They stay valid across snapshot rebuilds as long as the feed keeps the trip.
 use crate::Snapshot;
 use crate::build::{FLAG_NO_DROP_OFF, FLAG_NO_PICKUP, NONE};
+use crate::rt::Rt;
 use crate::tt::Timetable;
 
 /// One station: its representative stop and the served stops it consists of.
@@ -46,8 +47,15 @@ impl TripRef {
     fn base(&self, tt: &Timetable) -> u32 {
         tt.base[tt.route_tz[self.route as usize] as usize][self.day as usize]
     }
-    /// (arrival, departure) at `pos`, relative seconds.
-    pub fn times(&self, tt: &Timetable, pos: usize) -> (u32, u32) {
+    /// (arrival, departure) at `pos`, relative seconds, with realtime.
+    pub fn times(&self, tt: &Timetable, rt: &Rt, pos: usize) -> (u32, u32) {
+        match rt.get(self.trip, self.day) {
+            Some(t) if !t.cancelled => t.times[pos],
+            _ => self.sched_times(tt, pos),
+        }
+    }
+    /// Scheduled (arrival, departure) at `pos`, relative seconds.
+    pub fn sched_times(&self, tt: &Timetable, pos: usize) -> (u32, u32) {
         let (r, j, b) = (self.route as usize, self.j(tt), self.base(tt));
         (b + tt.arrs(r, pos)[j], b + tt.deps(r, pos)[j])
     }
@@ -66,7 +74,7 @@ fn date_of(tt: &Timetable, d: u32) -> jiff::civil::Date {
     first + jiff::Span::new().days(i64::from(d) - 1)
 }
 
-fn day_of(tt: &Timetable, date: jiff::civil::Date) -> Option<u32> {
+pub(crate) fn day_of(tt: &Timetable, date: jiff::civil::Date) -> Option<u32> {
     let first = jiff::civil::Date::strptime("%Y-%m-%d", &tt.meta.first_day).ok()?;
     let d = (date - first).get_days() as i64 + 1;
     (0..tt.days as i64).contains(&d).then_some(d as u32)
@@ -127,6 +135,7 @@ impl Snapshot {
         t: u32,
         n: usize,
         arrivals: bool,
+        rt: &Rt,
         route_type_ok: &dyn Fn(u16) -> bool,
     ) -> Vec<Event> {
         let tt = self.tt();
@@ -148,6 +157,41 @@ impl Snapshot {
                 };
                 if !skip && route_type_ok(tt.route_info_type[tt.route_info[r as usize] as usize]) {
                     pairs.push((s, r, p));
+                }
+            }
+        }
+        // trips with realtime times: their own events, whatever the schedule says
+        for &(s, r, p) in &pairs {
+            if !rt.has_route(r) {
+                continue;
+            }
+            let ru = r as usize;
+            let trip0 = tt.route_trip_off[ru];
+            for &(j, day) in rt.route_trips(r) {
+                let trip = trip0 + j;
+                let Some(tr) = rt.get(trip, day) else { continue };
+                let at = TripRef {
+                    route: r,
+                    trip,
+                    day,
+                };
+                let sched = at.sched_times(tt, p as usize);
+                let time = if tr.cancelled {
+                    if arrivals { sched.0 } else { sched.1 }
+                } else if tr.skipped(p as usize) {
+                    continue;
+                } else if arrivals {
+                    tr.times[p as usize].0
+                } else {
+                    tr.times[p as usize].1
+                };
+                if time >= t {
+                    out.push(Event {
+                        at,
+                        pos: p,
+                        stop: s,
+                        time,
+                    });
                 }
             }
         }
@@ -189,6 +233,9 @@ impl Snapshot {
                         }
                         let trip = trip0 + j as u32;
                         if tt.active(tt.trip_bits[trip as usize], day as usize) {
+                            if rt.has_route(r) && rt.get(trip, day).is_some() {
+                                continue; // listed above with its realtime time
+                            }
                             taken += 1;
                             out.push(Event {
                                 at: TripRef {
@@ -310,11 +357,11 @@ impl Snapshot {
         // the same train from several feeds: one entry (the longest run)
         out.sort_by_key(|(at, _)| {
             (
-                at.times(tt, 0).1,
+                at.sched_times(tt, 0).1,
                 std::cmp::Reverse(tt.n_route_stops(at.route as usize)),
             )
         });
-        out.dedup_by_key(|(at, _)| at.times(tt, 0).1);
+        out.dedup_by_key(|(at, _)| at.sched_times(tt, 0).1);
         out.truncate(limit);
         out
     }

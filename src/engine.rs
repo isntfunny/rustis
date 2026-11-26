@@ -33,6 +33,8 @@ pub struct Snapshot {
     max_labels: usize,
     /// Deutschlandticket validity per route (built on first use).
     dticket: std::sync::OnceLock<crate::dticket::RouteFilter>,
+    /// Realtime overlay (replaced as a whole on every feed update).
+    rt: std::sync::RwLock<std::sync::Arc<crate::rt::Rt>>,
 }
 
 /// Default per-search label budget; bounds the memory and time of searches
@@ -139,7 +141,32 @@ impl Snapshot {
             tt: Timetable::open(dir)?,
             max_labels: DEFAULT_MAX_LABELS,
             dticket: std::sync::OnceLock::new(),
+            rt: Default::default(),
         })
+    }
+
+    /// The current realtime overlay (cheap `Arc` clone).
+    pub(crate) fn rt(&self) -> std::sync::Arc<crate::rt::Rt> {
+        self.rt.read().unwrap().clone()
+    }
+
+    pub fn set_rt(&self, rt: crate::rt::Rt) {
+        *self.rt.write().unwrap() = std::sync::Arc::new(rt);
+    }
+
+    /// Applies one GTFS-RT feed (stream) as the only realtime source.
+    pub fn apply_rt(&self, prefix: &str, feed: impl std::io::Read) {
+        let mut rt = crate::rt::Rt::default();
+        rt.apply_feed(&self.tt, prefix, feed);
+        self.set_rt(rt);
+    }
+
+    pub fn rt_stats(&self) -> crate::rt::RtStats {
+        self.rt.read().unwrap().stats.clone()
+    }
+
+    pub(crate) fn timetable(&self) -> &Timetable {
+        &self.tt
     }
 
     /// Deutschlandticket validity of every route (see `crate::dticket`).
@@ -242,6 +269,7 @@ impl Snapshot {
         let allow_timed = route_mask
             .as_ref()
             .is_none_or(|m| m.iter().any(|&w| w != 0));
+        let rt = self.rt();
         if q.max_transfers > MAX_TRANSFERS {
             return Err(Error::invalid(format!(
                 "max_transfers must be ≤ {MAX_TRANSFERS}"
@@ -353,6 +381,7 @@ impl Snapshot {
                 max_transfers: q.max_transfers as usize,
                 window: deadline - d,
                 max_labels: self.max_labels,
+                rt: &rt,
             };
             let mut probe = |d: u32,
                              found: &mut Vec<(Journey, u32)>,
@@ -374,7 +403,7 @@ impl Snapshot {
                     {
                         continue;
                     }
-                    let dep = self.journey_departure(&j, d);
+                    let dep = self.journey_departure(&rt, &j, d);
                     latest = latest.max(Some(dep));
                     let sig = signature(&j);
                     if !found.iter().any(|(f, _)| signature(f) == sig) {
@@ -437,6 +466,7 @@ impl Snapshot {
                         max_transfers: q.max_transfers as usize,
                         window: w,
                         max_labels: self.max_labels,
+                        rt: &rt,
                     };
                     searches += 1;
                     let (js, st) = raptor::search(&self.tt, &query, &mut lb);
@@ -473,7 +503,7 @@ impl Snapshot {
                 let mut next = u32::MAX;
                 let mut added = false;
                 for j in js {
-                    let dep = self.journey_departure(&j, depart);
+                    let dep = self.journey_departure(&rt, &j, depart);
                     if first_dep
                         .is_some_and(|f| dep > f.saturating_add(q.alternatives_within_seconds))
                     {
@@ -508,7 +538,7 @@ impl Snapshot {
         }
         let mut itineraries: Vec<Itinerary> = found
             .iter()
-            .filter_map(|(j, _)| self.itinerary(j, &to_local))
+            .filter_map(|(j, _)| self.itinerary(&rt, j, &to_local))
             .collect();
         let omitted = found.len() - itineraries.len();
         itineraries.sort_by_key(|i| (i.departure, i.arrival, i.transfers));
@@ -610,7 +640,7 @@ impl Snapshot {
     }
 
     /// When the rider leaves the origin (latest possible) – relative seconds.
-    fn journey_departure(&self, j: &Journey, depart: u32) -> u32 {
+    fn journey_departure(&self, rt: &crate::rt::Rt, j: &Journey, depart: u32) -> u32 {
         let mut before = 0u32;
         for s in &j.steps {
             match s {
@@ -622,7 +652,7 @@ impl Snapshot {
                     board_pos,
                     ..
                 } => {
-                    let (t, d) = self.ride_times(*route, *trip, *day, *board_pos, *board_pos);
+                    let (t, d) = self.ride_times(rt, *route, *trip, *day, *board_pos, *board_pos);
                     let _ = d;
                     return t.saturating_sub(before);
                 }
@@ -634,7 +664,32 @@ impl Snapshot {
     }
 
     /// (departure at `bpos`, arrival at `apos`) of a trip, relative seconds.
-    fn ride_times(&self, route: u32, trip: u32, day: u32, bpos: u32, apos: u32) -> (u32, u32) {
+    fn ride_times(
+        &self,
+        rt: &crate::rt::Rt,
+        route: u32,
+        trip: u32,
+        day: u32,
+        bpos: u32,
+        apos: u32,
+    ) -> (u32, u32) {
+        if let Some(t) = rt.get(trip, day)
+            && !t.cancelled
+        {
+            return (t.times[bpos as usize].1, t.times[apos as usize].0);
+        }
+        self.sched_times(route, trip, day, bpos, apos)
+    }
+
+    /// Like `ride_times` without realtime.
+    pub(crate) fn sched_times(
+        &self,
+        route: u32,
+        trip: u32,
+        day: u32,
+        bpos: u32,
+        apos: u32,
+    ) -> (u32, u32) {
         let tt = &self.tt;
         let r = route as usize;
         let j = (trip - tt.route_trip_off[r]) as usize;
@@ -697,11 +752,14 @@ impl Snapshot {
             drop_off_booking_required: false,
             geometry,
             geometry_source: "stops",
+            real_time: false,
+            scheduled_times: None,
+            tracks: None,
             booking_info: None,
         }
     }
 
-    fn itinerary(&self, j: &Journey, to_local: &dyn Fn(u32) -> u32) -> Option<Itinerary> {
+    fn itinerary(&self, rt: &crate::rt::Rt, j: &Journey, to_local: &dyn Fn(u32) -> u32) -> Option<Itinerary> {
         let tt = &self.tt;
         let coord = |s: u32| tt.catalog.coord(s as usize);
         // Absolute times: rides fix the clock; walks after a ride start at its
@@ -720,7 +778,7 @@ impl Snapshot {
                 day,
                 board_pos,
                 ..
-            } => self.ride_times(route, trip, day, board_pos, board_pos).0,
+            } => self.ride_times(rt, route, trip, day, board_pos, board_pos).0,
             Step::Flex { dep, .. } => dep,
             _ => unreachable!(),
         });
@@ -821,7 +879,7 @@ impl Snapshot {
                     board_pos,
                     alight_pos,
                 } => {
-                    let (d, a) = self.ride_times(route, trip, day, board_pos, alight_pos);
+                    let (d, a) = self.ride_times(rt, route, trip, day, board_pos, alight_pos);
                     if d < t || clock.is_some_and(|c| d < c) {
                         return None; // inconsistent (must never happen)
                     }
@@ -838,6 +896,27 @@ impl Snapshot {
                         .collect();
                     let mut leg =
                         self.leg(LegKind::Transit, Some(b), Some(e), d, a, to_local, geometry);
+                    let plat = |s: u32| {
+                        let p = tt.stop_platform.get(s as usize);
+                        (!p.is_empty()).then(|| p.to_owned())
+                    };
+                    let over = rt.get(trip, day).filter(|t| !t.cancelled);
+                    let used = |pos: u32| {
+                        over.and_then(|t| t.changed_stop(pos as usize))
+                            .unwrap_or(tt.route_stop(r, pos as usize))
+                    };
+                    let (sb, se) = (tt.route_stop(r, board_pos as usize), tt.route_stop(r, alight_pos as usize));
+                    leg.tracks = Some(crate::LegTracks {
+                        from: plat(used(board_pos)),
+                        scheduled_from: plat(sb),
+                        to: plat(used(alight_pos)),
+                        scheduled_to: plat(se),
+                    });
+                    if over.is_some() {
+                        let (sd, sa) = self.sched_times(route, trip, day, board_pos, alight_pos);
+                        leg.real_time = true;
+                        leg.scheduled_times = Some((self.iso(sd, Some(b)), self.iso(sa, Some(e))));
+                    }
                     let info = tt.route_info[r] as usize;
                     leg.trip_id = Some(
                         tt.gtfs_trip_id

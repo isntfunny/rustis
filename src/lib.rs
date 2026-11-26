@@ -12,6 +12,7 @@ pub mod memory;
 mod model;
 pub mod motis;
 mod raptor;
+pub mod rt;
 mod script;
 mod search;
 pub mod store;

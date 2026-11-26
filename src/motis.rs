@@ -335,6 +335,25 @@ fn leg_json(ids: &Ids, l: &Leg, start: Option<[f64; 2]>, end: Option<[f64; 2]>) 
         .map(|(a, b)| [a, b])
         .collect();
     }
+    let (sdep, sarr) = match &l.scheduled_times {
+        Some((d, a)) => (utc(d), utc(a)),
+        None => (dep.clone(), arr.clone()),
+    };
+    let (mut from, mut to) = (from, to);
+    if l.scheduled_times.is_some() {
+        from["scheduledDeparture"] = json!(sdep);
+        to["scheduledArrival"] = json!(sarr);
+    }
+    if let Some(t) = &l.tracks {
+        if let Some(x) = &t.from {
+            from["track"] = json!(x);
+            from["scheduledTrack"] = json!(t.scheduled_from.as_ref().unwrap_or(x));
+        }
+        if let Some(x) = &t.to {
+            to["track"] = json!(x);
+            to["scheduledTrack"] = json!(t.scheduled_to.as_ref().unwrap_or(x));
+        }
+    }
     let mut v = json!({
         "mode": mode,
         "from": from,
@@ -342,9 +361,9 @@ fn leg_json(ids: &Ids, l: &Leg, start: Option<[f64; 2]>, end: Option<[f64; 2]>) 
         "duration": l.duration_seconds,
         "startTime": dep,
         "endTime": arr,
-        "scheduledStartTime": dep,
-        "scheduledEndTime": arr,
-        "realTime": false,
+        "scheduledStartTime": sdep,
+        "scheduledEndTime": sarr,
+        "realTime": l.real_time,
         "scheduled": transit,
         "cancelled": false,
         "legGeometry": {
@@ -673,6 +692,49 @@ fn stop_place(snap: &Snapshot, ids: &Ids, s: u32, arr: Option<u32>, dep: Option<
     v
 }
 
+/// A stop of a trip as MOTIS place: realtime and scheduled times, changed
+/// platform, skipped stop.
+fn trip_place(
+    snap: &Snapshot,
+    ids: &Ids,
+    rt: &crate::rt::Rt,
+    at: &crate::board::TripRef,
+    p: usize,
+    show_arr: bool,
+    show_dep: bool,
+) -> Value {
+    let tt = snap.tt();
+    let s = tt.route_stop(at.route as usize, p);
+    let ((a, d), (sa, sd)) = (at.times(tt, rt, p), at.sched_times(tt, p));
+    let mut v = stop_place(snap, ids, s, show_arr.then_some(a), show_dep.then_some(d));
+    if show_arr {
+        v["scheduledArrival"] = json!(ts(snap, sa));
+    }
+    if show_dep {
+        v["scheduledDeparture"] = json!(ts(snap, sd));
+    }
+    if let Some(tr) = rt.get(at.trip, at.day) {
+        if let Some(ns) = tr.changed_stop(p) {
+            let t = tt.stop_platform.get(ns as usize);
+            if !t.is_empty() {
+                v["track"] = json!(t);
+            }
+        }
+        if tr.skipped(p) || tr.cancelled {
+            v["cancelled"] = json!(true);
+        }
+    }
+    v
+}
+
+/// `realTime` / `cancelled` of a trip.
+fn rt_flags(rt: &crate::rt::Rt, at: &crate::board::TripRef, v: &mut Value) {
+    let tr = rt.get(at.trip, at.day);
+    v["realTime"] = json!(tr.is_some_and(|t| !t.cancelled));
+    v["cancelled"] = json!(tr.is_some_and(|t| t.cancelled));
+    v["tripCancelled"] = v["cancelled"].clone();
+}
+
 fn station_place(snap: &Snapshot, ids: &Ids, st: &crate::board::Station) -> Value {
     let tt = snap.tt();
     let mut v = stop_place(snap, ids, st.rep, None, None);
@@ -797,11 +859,12 @@ pub fn stoptimes(snap: &Snapshot, q: &StopTimesQuery) -> Result<Value, Error> {
             .collect()
     });
     let type_ok = |t: u16| modes.as_ref().is_none_or(|m| allowed(m, mode(t)));
-    for e in snap.board(&st.stops, t, 2 * n, arrivals, &type_ok) {
-        let (a, d) = e.at.times(tt, e.pos as usize);
+    let rt = snap.rt();
+    for e in snap.board(&st.stops, t, 2 * n, arrivals, &rt, &type_ok) {
         let last = tt.n_route_stops(e.at.route as usize) - 1;
         let mut v = json!({});
         trip_fields(snap, &ids, &e.at, &mut v);
+        rt_flags(&rt, &e.at, &mut v);
         if !seen.insert((
             e.time,
             v["displayName"].to_string(),
@@ -811,22 +874,17 @@ pub fn stoptimes(snap: &Snapshot, q: &StopTimesQuery) -> Result<Value, Error> {
         }
         let first = e.pos == 0;
         let is_last = e.pos as usize == last;
-        v["place"] = stop_place(
+        v["place"] = trip_place(
             snap,
             &ids,
-            e.stop,
-            (!first).then_some(a),
-            (!is_last).then_some(d),
+            &rt,
+            &e.at,
+            e.pos as usize,
+            !first,
+            !is_last,
         );
         v["pickupDropoffType"] = json!("NORMAL");
-        let (end_arr, _) = e.at.times(tt, last);
-        v["tripTo"] = stop_place(
-            snap,
-            &ids,
-            tt.route_stop(e.at.route as usize, last),
-            Some(end_arr),
-            None,
-        );
+        v["tripTo"] = trip_place(snap, &ids, &rt, &e.at, last, true, false);
         let dt = snap.dticket();
         v["deutschlandticket"] = json!(if arrivals {
             dt.allows_ride(e.at.route, e.pos as usize - 1, e.pos as usize)
@@ -874,19 +932,13 @@ pub fn trip(snap: &Snapshot, q: &TripQuery) -> Result<Value, Error> {
     let tt = snap.tt();
     let r = at.route as usize;
     let last = tt.n_route_stops(r) - 1;
-    let (_, dep) = at.times(tt, 0);
-    let (arr, _) = at.times(tt, last);
+    let rt = snap.rt();
+    let (_, dep) = at.times(tt, &rt, 0);
+    let (arr, _) = at.times(tt, &rt, last);
+    let (_, sdep) = at.sched_times(tt, 0);
+    let (sarr, _) = at.sched_times(tt, last);
     let stops: Vec<Value> = (0..=last)
-        .map(|p| {
-            let (a, d) = at.times(tt, p);
-            stop_place(
-                snap,
-                &ids,
-                tt.route_stop(r, p),
-                (p > 0).then_some(a),
-                (p < last).then_some(d),
-            )
-        })
+        .map(|p| trip_place(snap, &ids, &rt, &at, p, p > 0, p < last))
         .collect();
     let geometry: Vec<[f64; 2]> = (0..=last)
         .filter_map(|p| tt.catalog.coord(tt.route_stop(r, p) as usize))
@@ -897,8 +949,8 @@ pub fn trip(snap: &Snapshot, q: &TripQuery) -> Result<Value, Error> {
         "duration": arr - dep,
         "startTime": ts(snap, dep),
         "endTime": ts(snap, arr),
-        "scheduledStartTime": ts(snap, dep),
-        "scheduledEndTime": ts(snap, arr),
+        "scheduledStartTime": ts(snap, sdep),
+        "scheduledEndTime": ts(snap, sarr),
         "scheduled": true,
         "interlineWithPreviousLeg": false,
         "intermediateStops": stops[1..last],
@@ -910,6 +962,7 @@ pub fn trip(snap: &Snapshot, q: &TripQuery) -> Result<Value, Error> {
         "deutschlandticket": snap.dticket().allows_ride(at.route, 0, last),
     });
     trip_fields(snap, &ids, &at, &mut leg);
+    rt_flags(&rt, &at, &mut leg);
     Ok(json!({
         "duration": arr - dep,
         "startTime": ts(snap, dep),
@@ -933,6 +986,7 @@ pub fn trip_by_name(snap: &Snapshot, q: &TripByNameQuery) -> Result<Value, Error
     };
     let limit = q.limit.unwrap_or(10).clamp(1, 50);
     let tt = snap.tt();
+    let rt = snap.rt();
     let trips = snap.trips_by_name(
         &q.name,
         date,
@@ -945,15 +999,15 @@ pub fn trip_by_name(snap: &Snapshot, q: &TripByNameQuery) -> Result<Value, Error
             let last = tt.n_route_stops(r) - 1;
             let mut v = json!({
                 "serviceDate": date.to_string(),
-                "from": stop_place(snap, &ids, tt.route_stop(r, 0), None, Some(at.times(tt, 0).1)),
-                "to": stop_place(snap, &ids, tt.route_stop(r, last), Some(at.times(tt, last).0), None),
+                "from": trip_place(snap, &ids, &rt, at, 0, false, true),
+                "to": trip_place(snap, &ids, &rt, at, last, true, false),
             });
             if let Some(p) = pos {
                 let p = *p as usize;
-                let (a, d) = at.times(tt, p);
-                v["stop"] = stop_place(snap, &ids, tt.route_stop(r, p), (p > 0).then_some(a), (p < last).then_some(d));
+                v["stop"] = trip_place(snap, &ids, &rt, at, p, p > 0, p < last);
             }
             trip_fields(snap, &ids, at, &mut v);
+            rt_flags(&rt, at, &mut v);
             v
         }).collect::<Vec<_>>(),
     }))

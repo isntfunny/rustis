@@ -159,6 +159,7 @@ async fn health(State(s): State<AppState>) -> Response {
                 "first_day": snap.first_day(),
         "horizon_days": snap.meta().horizon_days,
         "reload": reload,
+        "realtime": snap.rt_stats(),
         "warnings": snap.warnings(),
         "feed_warnings": snap.feed_warnings(7),
     }))

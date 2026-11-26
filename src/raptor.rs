@@ -12,6 +12,7 @@
 //!   `bound` is the best target arrival found so far (or the search window).
 //!   `lb` never overestimates, so no journey that could beat `bound` is lost.
 use crate::build::{FLAG_NO_DROP_OFF, FLAG_NO_PICKUP, FORBIDDEN, NONE};
+use crate::rt::{Rt, TripRt};
 use crate::tt::Timetable;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
@@ -114,6 +115,8 @@ pub struct Query<'a> {
     /// and time of searches that explore most of the network); the result
     /// is then flagged as possibly incomplete.
     pub max_labels: usize,
+    /// Realtime overlay (delays, cancellations, skipped stops).
+    pub rt: &'a Rt,
 }
 
 #[derive(Clone, Debug)]
@@ -302,7 +305,7 @@ pub fn search<'t>(
     (out, s.stats)
 }
 
-impl Search<'_, '_, '_> {
+impl<'q> Search<'_, 'q, '_> {
     fn note_target(&mut self, k: usize, stop: u32, arr: u32, kind: From) {
         self.note_target_walk(k, stop, arr, kind, NONE, 0);
     }
@@ -586,17 +589,21 @@ impl Search<'_, '_, '_> {
         // current trip: (local trip index, day, base, board pos, board_from)
         let mut cur: Option<(usize, u32, u32, u32, From)> = None;
         let usable = self.q.positions.and_then(|m| m.get(&r));
+        // realtime: trip of the current ride with overridden times, if any
+        let mut cur_rt: Option<&'q TripRt> = None;
         for pos in p0 as usize..n {
             if usable.is_some_and(|u| !u[pos]) {
                 cur = None;
+                cur_rt = None;
                 continue;
             }
             let s = tt.route_stop(ru, pos);
             let flags = tt.route_flag(ru, pos);
             if let Some((j, day, base, bpos, from)) = cur
                 && flags & FLAG_NO_DROP_OFF == 0
+                && !cur_rt.is_some_and(|t| t.skipped(pos))
             {
-                let a = base + tt.arrs(ru, pos)[j];
+                let a = cur_rt.map_or_else(|| base + tt.arrs(ru, pos)[j], |t| t.times[pos].0);
                 if self.best_ride.get(s).is_none_or(|b| a < b) && !self.pruned(s, a) {
                     self.best_ride.set(s, a);
                     self.inserted += 1;
@@ -624,7 +631,9 @@ impl Search<'_, '_, '_> {
                 continue;
             };
             // Only labels that improved in round k-1 trigger boarding.
-            let cur_dep = cur.map(|(j, _, base, _, _)| base + tt.deps(ru, pos)[j]);
+            let cur_dep = cur.map(|(j, _, base, _, _)| {
+                cur_rt.map_or_else(|| base + tt.deps(ru, pos)[j], |t| t.times[pos].1)
+            });
             let rules = self.rules_for(s, a_stop, a_trip, a_route);
             let t_search = match (&rules, ready) {
                 (None, Some(t)) => t,
@@ -640,7 +649,7 @@ impl Search<'_, '_, '_> {
             if cur_dep.is_some_and(|d| d <= t_search) {
                 continue;
             }
-            if let Some((j, day, base)) =
+            if let Some((j, day, base, over)) =
                 self.earliest_trip(ru, pos, tz, t_search, cur_dep, |tt, j, dep| {
                     let Some(rs) = &rules else { return true };
                     let trip = trip0 + j as u32;
@@ -653,6 +662,7 @@ impl Search<'_, '_, '_> {
                 })
             {
                 cur = Some((j, day, base, pos as u32, from));
+                cur_rt = over;
             }
         }
     }
@@ -705,15 +715,17 @@ impl Search<'_, '_, '_> {
         t: u32,
         limit: Option<u32>,
         ok: impl Fn(&Timetable, usize, u32) -> bool,
-    ) -> Option<(usize, u32, u32)> {
+    ) -> Option<(usize, u32, u32, Option<&'q TripRt>)> {
         let tt = self.tt;
+        let rt: &'q Rt = self.q.rt;
+        let over = rt.has_route(r as u32);
         let deps = tt.deps(r, pos);
         let base = &tt.base[tz];
         let span = tt.route_max_time[r] / 86_400 + 1;
         // day whose base is the last one ≤ t
         let d_t = base.partition_point(|&b| b <= t).saturating_sub(1) as u32;
         let trip0 = tt.route_trip_off[r] as usize;
-        let mut best: Option<(usize, u32, u32)> = None;
+        let mut best: Option<(usize, u32, u32, Option<&'q TripRt>)> = None;
         let mut best_t = limit.unwrap_or(u32::MAX).min(self.bound);
         for day in d_t.saturating_sub(span)..=d_t + 1 {
             if day as usize >= tt.days {
@@ -734,10 +746,29 @@ impl Search<'_, '_, '_> {
                     break;
                 }
                 self.stats.trip_checks += 1;
-                if tt.active(tt.trip_bits[trip0 + j], day as usize) && ok(tt, j, td) {
-                    best = Some((j, day, b));
+                if tt.active(tt.trip_bits[trip0 + j], day as usize)
+                    && !(over && rt.get((trip0 + j) as u32, day).is_some())
+                    && ok(tt, j, td)
+                {
+                    best = Some((j, day, b, None));
                     best_t = td;
                     break;
+                }
+            }
+        }
+        if over {
+            // trips with realtime times are not in the sorted base arrays
+            for &(j, day) in rt.route_trips(r as u32) {
+                let Some(tr) = rt.get((trip0 + j as usize) as u32, day) else {
+                    continue;
+                };
+                if tr.cancelled || tr.skipped(pos) {
+                    continue;
+                }
+                let td = tr.times[pos].1;
+                if td >= t && td < best_t && ok(tt, j as usize, td) {
+                    best = Some((j as usize, day, base[day as usize], Some(tr)));
+                    best_t = td;
                 }
             }
         }
